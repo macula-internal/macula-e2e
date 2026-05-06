@@ -15,10 +15,15 @@ FROM erlang:27-alpine AS builder
 # because some macula NIF transitive crates (time-core@0.1.8 etc.)
 # require rustc >= 1.88 — alpine's package lags.
 RUN apk add --no-cache \
-        git build-base pkgconfig openssl-dev curl ca-certificates
+        git build-base pkgconfig openssl-dev curl ca-certificates \
+        cmake perl linux-headers
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
+# musl-targeted rustup defaults to crt-static, which can't produce
+# cdylibs (the macula_quic NIF needs one). Disable it. Mirrors the
+# hecate-stub Dockerfile's pattern.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 WORKDIR /work
 COPY rebar.config ./
