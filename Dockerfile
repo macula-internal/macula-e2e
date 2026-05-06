@@ -11,8 +11,14 @@
 # ----- builder ---------------------------------------------------------
 FROM erlang:27-alpine AS builder
 
+# Install build deps. Use rustup rather than alpine's `rust' package
+# because some macula NIF transitive crates (time-core@0.1.8 etc.)
+# require rustc >= 1.88 — alpine's package lags.
 RUN apk add --no-cache \
-        git build-base pkgconfig openssl-dev rust cargo curl ca-certificates
+        git build-base pkgconfig openssl-dev curl ca-certificates
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /work
 COPY rebar.config ./
