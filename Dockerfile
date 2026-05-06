@@ -1,23 +1,18 @@
 # macula-e2e — runner image.
 #
 # Stage 1 builds the rebar3 project (slow: macula 4.x ships Rust NIFs
-# that compile from source). Stage 2 ships only the compiled artifacts
-# plus the test sources + rebar3 to invoke them at runtime.
+# that compile from source). Stage 2 ships compiled artifacts + test
+# sources + erl/rebar3 to invoke `rebar3 ct' at runtime.
 #
-# Both stages run on Debian bookworm — macula's NIFs were developed
-# against glibc and we keep the build/runtime libc consistent.
+# Both stages alpine-musl. Matches the workspace convention
+# (hecate-stub, hecate-daemon, macula, reckon-* all build against
+# erlang:27-alpine).
 
 # ----- builder ---------------------------------------------------------
-FROM hexpm/erlang:27.3.4.4-debian-bookworm-20250520 AS builder
+FROM erlang:27-alpine AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git build-essential pkg-config libssl-dev curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Rust toolchain — macula's NIFs use cargo + rustler.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain stable --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN apk add --no-cache \
+        git build-base pkgconfig openssl-dev rust cargo curl ca-certificates
 
 WORKDIR /work
 COPY rebar.config ./
@@ -25,11 +20,9 @@ COPY src src/
 RUN rebar3 deps && rebar3 compile
 
 # ----- runtime ---------------------------------------------------------
-FROM hexpm/erlang:27.3.4.4-debian-bookworm-20250520
+FROM erlang:27-alpine
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl3 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache libssl3 ca-certificates
 
 WORKDIR /work
 COPY --from=builder /work /work
