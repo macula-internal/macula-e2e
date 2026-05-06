@@ -1,0 +1,14 @@
+{application, macula_e2e, [
+    {description, "End-to-end probes for the Macula relay fleet"},
+    {vsn, "0.1.0"},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        macula
+    ]},
+    {modules, []},
+    {registered, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"Codeberg", "https://codeberg.org/macula-internal/macula-e2e"}]}
+]}.
