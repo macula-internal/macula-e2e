@@ -32,7 +32,10 @@
     streaming_rpc/1,
     dht_put_find/1,
     weather_subscribe/1,
-    pool_close_cleanup/1
+    pool_close_cleanup/1,
+    cross_station_pubsub/1,
+    cross_station_unary_rpc/1,
+    cross_station_dht_put_find/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -54,36 +57,64 @@ all() ->
      streaming_rpc,
      dht_put_find,
      weather_subscribe,
-     pool_close_cleanup].
+     pool_close_cleanup,
+     %% Cross-station hop probes — only run when MACULA_E2E_BOOTSTRAP_OTHER
+     %% is set. Each tc skips cleanly when the second pool isn't wired.
+     cross_station_pubsub,
+     cross_station_unary_rpc,
+     cross_station_dht_put_find].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
     Bootstrap = bootstrap_seeds(),
-    ct:pal("[e2e] bootstrap = ~p", [Bootstrap]),
+    BootstrapOther = bootstrap_seeds_other(),
+    ct:pal("[e2e] bootstrap        = ~p", [Bootstrap]),
+    ct:pal("[e2e] bootstrap_other  = ~p", [BootstrapOther]),
     {ok, Pool}  = macula:connect(Bootstrap, #{}),
     {ok, Other} = macula:connect(Bootstrap, #{}),
-    on_initial_health(wait_for_healthy([Pool, Other], ?WAIT_HEALTHY_MS),
-                      Pool, Other, Bootstrap, Config).
+    {CrossOpt, CrossPools} =
+        case BootstrapOther of
+            undefined -> {undefined, []};
+            _ ->
+                {ok, X} = macula:connect(BootstrapOther, #{}),
+                {X, [X]}
+        end,
+    %% macula:connect/2 spawns gen_servers linked to the caller. CT's
+    %% init_per_suite controller exits with Config as its reason after
+    %% returning, killing the linked pools before any test case runs.
+    %% Detach so the pools survive into the test cases + end_per_suite.
+    unlink(Pool),
+    unlink(Other),
+    [unlink(P) || P <- CrossPools],
+    on_initial_health(wait_for_healthy([Pool, Other | CrossPools],
+                                       ?WAIT_HEALTHY_MS),
+                      Pool, Other, CrossOpt, Bootstrap, BootstrapOther,
+                      Config).
 
-on_initial_health(ok, Pool, Other, Bootstrap, Config) ->
+on_initial_health(ok, Pool, Other, Cross, Bootstrap, BootstrapOther, Config) ->
     {ok, #{healthy_links := N}} = macula:status(Pool),
     ct:pal("[e2e] pools ready — ~p healthy link(s) on shared pool",
            [N]),
     [{pool, Pool},
      {other, Other},
+     {cross, Cross},
      {bootstrap, Bootstrap},
+     {bootstrap_other, BootstrapOther},
      {test_realm,    macula_realm:id(<<"_test">>)},
      {test_realm_a,  macula_realm:id(<<"_test_a">>)},
      {test_realm_b,  macula_realm:id(<<"_test_b">>)},
      {weather_realm, macula_realm:id(<<"io.macula">>)} | Config];
-on_initial_health(timeout, Pool, Other, Bootstrap, _Config) ->
+on_initial_health(timeout, Pool, Other, Cross, Bootstrap, _BootstrapOther,
+                  _Config) ->
     macula:close(Pool),
     macula:close(Other),
+    close_if_set(Cross),
     {skip, {fleet_not_reachable, Bootstrap}}.
 
 end_per_suite(Config) ->
     close_if_set(?config(pool, Config)),
     close_if_set(?config(other, Config)),
+    close_if_set(?config(cross, Config)),
     ok.
 
 close_if_set(undefined) -> ok;
@@ -141,15 +172,58 @@ pool_close_cleanup(Config) ->
     Bootstrap = ?config(bootstrap, Config),
     expect_ok(macula_e2e_probe:pool_close_cleanup(Bootstrap)).
 
+%%--------------------------------------------------------------------
+%% Cross-station hop probes — exercise daemon→station→station→daemon.
+%% Skip cleanly when MACULA_E2E_BOOTSTRAP_OTHER isn't set.
+%%--------------------------------------------------------------------
+
+cross_station_pubsub(Config) ->
+    cross_or_skip(Config, fun(Pub, Sub) ->
+        Realm = ?config(test_realm, Config),
+        Topic = unique_topic(<<"e2e.cross.pubsub">>),
+        macula_e2e_probe:cross_station_pubsub(Pub, Sub, Realm, Topic)
+    end).
+
+cross_station_unary_rpc(Config) ->
+    cross_or_skip(Config, fun(Server, Caller) ->
+        Realm = ?config(test_realm, Config),
+        Procedure = unique_topic(<<"e2e.cross.echo">>),
+        macula_e2e_probe:cross_station_unary_rpc(Server, Caller,
+                                                  Realm, Procedure)
+    end).
+
+cross_station_dht_put_find(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        Realm = ?config(test_realm, Config),
+        macula_e2e_probe:cross_station_dht_put_find(Writer, Reader, Realm)
+    end).
+
+cross_or_skip(Config, Fun) ->
+    case ?config(cross, Config) of
+        undefined ->
+            {skip, "MACULA_E2E_BOOTSTRAP_OTHER not set — "
+                   "cross-station probe inactive"};
+        Cross ->
+            Pool = ?config(pool, Config),
+            expect_ok(Fun(Pool, Cross))
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
 
 bootstrap_seeds() ->
-    bootstrap_seeds(os:getenv("MACULA_E2E_BOOTSTRAP")).
+    parse_seeds(os:getenv("MACULA_E2E_BOOTSTRAP"), ?DEFAULT_BOOTSTRAP).
 
-bootstrap_seeds(false) -> ?DEFAULT_BOOTSTRAP;
-bootstrap_seeds(Env) ->
+bootstrap_seeds_other() ->
+    case parse_seeds(os:getenv("MACULA_E2E_BOOTSTRAP_OTHER"), undefined) of
+        undefined -> undefined;
+        []        -> undefined;
+        Seeds     -> Seeds
+    end.
+
+parse_seeds(false, Default) -> Default;
+parse_seeds(Env,   _Default) ->
     [list_to_binary(string:trim(U))
      || U <- string:split(Env, ",", all),
         string:trim(U) =/= ""].

@@ -1,4 +1,5 @@
 _build/
+_checkouts/
 .rebar3/
 rebar.lock
 *.beam

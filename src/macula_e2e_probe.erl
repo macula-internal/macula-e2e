@@ -33,7 +33,10 @@
     streaming_rpc/4,
     dht_put_find/2,
     weather_subscribe/3,
-    pool_close_cleanup/1
+    pool_close_cleanup/1,
+    cross_station_pubsub/4,
+    cross_station_unary_rpc/4,
+    cross_station_dht_put_find/3
 ]).
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
@@ -117,9 +120,24 @@ unary_rpc(ServerPool, CallerPool, Realm, Procedure) ->
     catch macula:unadvertise(ServerPool, Realm, Procedure),
     classify_unary(Reply, Args).
 
-classify_unary({ok, #{<<"got">> := Got}}, Args) when Got =:= Args -> ok;
-classify_unary({ok, Other}, Args)  -> {error, {unexpected_reply, Other, expected, Args}};
-classify_unary({error, _} = E, _)  -> E.
+%% Macula 4.2.x CBOR decoder converts short text keys to atoms on
+%% receive but we send binary keys. Normalise both sides to binary
+%% before equality so the probe survives encoder asymmetry without
+%% becoming a typing test.
+classify_unary({ok, #{<<"got">> := Got}}, Args) ->
+    classify_unary_match(Got, Args);
+classify_unary({ok, #{got := Got}}, Args) ->
+    classify_unary_match(Got, Args);
+classify_unary({ok, Other}, Args) ->
+    {error, {unexpected_reply, Other, expected, Args}};
+classify_unary({error, _} = E, _) ->
+    E.
+
+classify_unary_match(Got, Args) ->
+    case normalise_keys(Got) =:= normalise_keys(Args) of
+        true  -> ok;
+        false -> {error, {unexpected_reply, Got, expected, Args}}
+    end.
 
 %% @doc Streaming RPC — Server advertises a server_stream that
 %% emits N integer chunks, Caller drains them.
@@ -128,7 +146,11 @@ classify_unary({error, _} = E, _)  -> E.
                     macula:realm(),
                     macula:procedure()) -> result().
 streaming_rpc(ServerPool, CallerPool, Realm, Procedure) ->
-    Handler = fun(Stream, #{<<"n">> := N}) ->
+    Handler = fun(Stream, Args) ->
+        N = case Args of
+                #{<<"n">> := X} -> X;
+                #{n         := X} -> X
+            end,
         lists:foreach(
           fun(I) -> ok = macula:send(Stream, integer_to_binary(I)) end,
           lists:seq(1, N)),
@@ -155,9 +177,10 @@ classify_stream({error, _} = E)                     -> E.
 drain_stream(Stream, Acc) ->
     on_recv(macula:recv(Stream, 5_000), Stream, Acc).
 
-on_recv({chunk, Bin}, Stream, Acc) -> drain_stream(Stream, [Bin | Acc]);
-on_recv(eof, _Stream, Acc)         -> {ok, lists:reverse(Acc)};
-on_recv({error, _} = E, _Stream, _Acc) -> E.
+on_recv({chunk, Bin}, Stream, Acc)        -> drain_stream(Stream, [Bin | Acc]);
+on_recv({data, Term}, Stream, Acc)        -> drain_stream(Stream, [Term | Acc]);
+on_recv(eof, _Stream, Acc)                -> {ok, lists:reverse(Acc)};
+on_recv({error, _} = E, _Stream, _Acc)    -> E.
 
 %% @doc DHT round-trip — put a fresh-identity node_record, find it
 %% by its storage key. Replication delay budgeted at
@@ -177,7 +200,12 @@ classify_put_find(ok, Pool, Key) ->
 classify_put_find({error, _} = E, _Pool, _Key) ->
     E.
 
-classify_find({ok, #{type := _, payload := _, sig := _}}, _Key) -> ok;
+%% Macula 4.2.x decoded record keeps the on-wire field names: `key',
+%% `payload', `signature', `type', `version', `created_at',
+%% `expires_at'. (Legacy `sig' was renamed.) Accept both for forward
+%% compatibility.
+classify_find({ok, #{type := _, payload := _, signature := _}}, _Key) -> ok;
+classify_find({ok, #{type := _, payload := _, sig := _}},       _Key) -> ok;
 classify_find({ok, Other}, Key) -> {error, {unexpected_record, Key, Other}};
 classify_find({error, _} = E, _Key) -> E.
 
@@ -192,6 +220,44 @@ weather_subscribe(Pool, Realm, MaxWaitMs) ->
     Result = await_any_event(SubRef, MaxWaitMs),
     catch macula:unsubscribe(Pool, SubRef),
     Result.
+
+%% @doc Cross-station pub/sub roundtrip. PubPool is dialled into one
+%% bootstrap station; SubPool into a DIFFERENT bootstrap station. The
+%% published event MUST traverse the inter-station mesh edge to reach
+%% the subscriber. Same wire shape as `pubsub_roundtrip/4'; the test
+%% case wires distinct pools.
+-spec cross_station_pubsub(PubPool :: macula:pool(),
+                           SubPool :: macula:pool(),
+                           macula:realm(),
+                           macula:topic()) -> result().
+cross_station_pubsub(PubPool, SubPool, Realm, Topic) ->
+    pubsub_roundtrip(PubPool, SubPool, Realm, Topic).
+
+%% @doc Cross-station unary RPC roundtrip. Server advertises through
+%% one station; Caller dials a DIFFERENT station. The CALL frame must
+%% route across the mesh (relay-side procedure registry must include
+%% the cross-station link as a route to the advertising station).
+-spec cross_station_unary_rpc(ServerPool :: macula:pool(),
+                              CallerPool :: macula:pool(),
+                              macula:realm(),
+                              macula:procedure()) -> result().
+cross_station_unary_rpc(ServerPool, CallerPool, Realm, Procedure) ->
+    unary_rpc(ServerPool, CallerPool, Realm, Procedure).
+
+%% @doc Cross-station DHT roundtrip. WriterPool puts through one
+%% station; ReaderPool finds through a DIFFERENT station. The record
+%% must replicate via DHT gossip across the inter-station mesh.
+-spec cross_station_dht_put_find(WriterPool :: macula:pool(),
+                                 ReaderPool :: macula:pool(),
+                                 macula:realm()) -> result().
+cross_station_dht_put_find(WriterPool, ReaderPool, Realm) ->
+    Identity = macula_identity:generate(),
+    NodeId = macula_identity:public(Identity),
+    Record = macula_record:node_record(NodeId, [Realm], 0),
+    Signed = macula_record:sign(Record, Identity),
+    Key = macula_record:storage_key(Signed),
+    classify_put_find(macula:put_record(WriterPool, Signed),
+                      ReaderPool, Key).
 
 %% @doc Pool close emits a `macula_event_gone' to every subscriber.
 %% Opens its own pool so the suite-shared one is undisturbed.
@@ -232,14 +298,32 @@ unique_topic(Prefix) ->
     <<Prefix/binary, ".", Suffix/binary>>.
 
 await_event_match(SubRef, Topic, ExpectedPayload, TimeoutMs) ->
+    Expected1 = normalise_keys(ExpectedPayload),
     receive
-        {macula_event, SubRef, Topic, Got, _Meta} when Got =:= ExpectedPayload ->
-            ok;
         {macula_event, SubRef, Topic, Got, _Meta} ->
-            {error, {payload_mismatch, expected, ExpectedPayload, got, Got}}
+            case normalise_keys(Got) =:= Expected1 of
+                true  -> ok;
+                false -> {error, {payload_mismatch, expected,
+                                  ExpectedPayload, got, Got}}
+            end
     after TimeoutMs ->
         {error, {no_event, Topic, expected, ExpectedPayload}}
     end.
+
+%% Strip the SDK's CBOR atom/text-tuple key encoding so probe
+%% assertions can compare semantically. Accepts atom keys, plain
+%% binary keys, and `{text, Bin}' keys; emits canonical binary keys.
+normalise_keys(M) when is_map(M) ->
+    maps:fold(fun(K, V, Acc) -> Acc#{normalise_key(K) => normalise_keys(V)} end,
+              #{}, M);
+normalise_keys(L) when is_list(L) ->
+    [normalise_keys(X) || X <- L];
+normalise_keys(X) ->
+    X.
+
+normalise_key({text, B}) when is_binary(B) -> B;
+normalise_key(K) when is_atom(K)           -> atom_to_binary(K, utf8);
+normalise_key(K)                           -> K.
 
 await_any_event(SubRef, TimeoutMs) ->
     receive
