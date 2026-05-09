@@ -216,15 +216,7 @@ classify_find({error, _} = E, _Key) -> E.
 %% the pool, so the blob lives on the station the daemon dialled.
 -spec put_get_content(macula:pool()) -> result().
 put_get_content(Pool) ->
-    %% v4.2.7: 28-byte fixed string round-trips reliably; larger
-    %% random binaries occasionally surface a hash mismatch traced to
-    %% the wire encoding of CBOR byte strings with AI=25 length
-    %% headers. The single-block surface this exercises is the
-    %% put_content / get_content RPC plumbing — the encoding gap
-    %% will be fixed in macula 4.2.8 once chunked manifests land
-    %% (each chunk fits in the single-byte / 8-bit length range, so
-    %% the AI=25 path is bypassed).
-    Bytes = <<"hello macula content sharing">>,
+    Bytes = crypto:strong_rand_bytes(8192),
     classify_put_content(macula:put_content(Pool, Bytes), Pool, Bytes).
 
 classify_put_content({ok, MCID}, Pool, Bytes) ->
