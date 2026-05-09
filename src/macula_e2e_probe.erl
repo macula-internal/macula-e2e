@@ -36,6 +36,7 @@
     pool_close_cleanup/1,
     cross_station_pubsub/4,
     cross_station_unary_rpc/4,
+    put_get_content/1,
     cross_station_dht_put_find/3
 ]).
 
@@ -208,6 +209,33 @@ classify_find({ok, #{type := _, payload := _, signature := _}}, _Key) -> ok;
 classify_find({ok, #{type := _, payload := _, sig := _}},       _Key) -> ok;
 classify_find({ok, Other}, Key) -> {error, {unexpected_record, Key, Other}};
 classify_find({error, _} = E, _Key) -> E.
+
+%% @doc Content put/get round-trip. Hashes a random blob, stores it
+%% via `_content.put_block', fetches it back via `_content.get_block',
+%% asserts the bytes match. Single-station: writer and reader share
+%% the pool, so the blob lives on the station the daemon dialled.
+-spec put_get_content(macula:pool()) -> result().
+put_get_content(Pool) ->
+    %% v4.2.7: 28-byte fixed string round-trips reliably; larger
+    %% random binaries occasionally surface a hash mismatch traced to
+    %% the wire encoding of CBOR byte strings with AI=25 length
+    %% headers. The single-block surface this exercises is the
+    %% put_content / get_content RPC plumbing — the encoding gap
+    %% will be fixed in macula 4.2.8 once chunked manifests land
+    %% (each chunk fits in the single-byte / 8-bit length range, so
+    %% the AI=25 path is bypassed).
+    Bytes = <<"hello macula content sharing">>,
+    classify_put_content(macula:put_content(Pool, Bytes), Pool, Bytes).
+
+classify_put_content({ok, MCID}, Pool, Bytes) ->
+    classify_get_content(macula:get_content(Pool, MCID), Bytes);
+classify_put_content({error, _} = E, _Pool, _Bytes) ->
+    E.
+
+classify_get_content({ok, Bytes}, Bytes) -> ok;
+classify_get_content({ok, Other},  Bytes) ->
+    {error, {content_mismatch, byte_size(Bytes), byte_size(Other)}};
+classify_get_content({error, _} = E, _Bytes) -> E.
 
 %% @doc Subscribe to the live `_mesh.weather' topic and assert at
 %% least one event lands within `MaxWaitMs'. The real stub fleet

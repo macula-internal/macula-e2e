@@ -33,6 +33,7 @@
     dht_put_find/1,
     weather_subscribe/1,
     pool_close_cleanup/1,
+    put_get_content/1,
     cross_station_pubsub/1,
     cross_station_unary_rpc/1,
     cross_station_dht_put_find/1
@@ -57,6 +58,7 @@ all() ->
      streaming_rpc,
      dht_put_find,
      weather_subscribe,
+     put_get_content,
      pool_close_cleanup,
      %% Cross-station hop probes — only run when MACULA_E2E_BOOTSTRAP_OTHER
      %% is set. Each tc skips cleanly when the second pool isn't wired.
@@ -171,6 +173,10 @@ weather_subscribe(Config) ->
 pool_close_cleanup(Config) ->
     Bootstrap = ?config(bootstrap, Config),
     expect_ok(macula_e2e_probe:pool_close_cleanup(Bootstrap)).
+
+put_get_content(Config) ->
+    Pool = ?config(pool, Config),
+    expect_ok(macula_e2e_probe:put_get_content(Pool)).
 
 %%--------------------------------------------------------------------
 %% Cross-station hop probes — exercise daemon→station→station→daemon.
