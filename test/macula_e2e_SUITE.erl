@@ -36,7 +36,8 @@
     put_get_content/1,
     cross_station_pubsub/1,
     cross_station_unary_rpc/1,
-    cross_station_dht_put_find/1
+    cross_station_dht_put_find/1,
+    cross_station_put_content/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -64,7 +65,8 @@ all() ->
      %% is set. Each tc skips cleanly when the second pool isn't wired.
      cross_station_pubsub,
      cross_station_unary_rpc,
-     cross_station_dht_put_find].
+     cross_station_dht_put_find,
+     cross_station_put_content].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
@@ -202,6 +204,11 @@ cross_station_dht_put_find(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
         Realm = ?config(test_realm, Config),
         macula_e2e_probe:cross_station_dht_put_find(Writer, Reader, Realm)
+    end).
+
+cross_station_put_content(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        macula_e2e_probe:cross_station_put_content(Writer, Reader)
     end).
 
 cross_or_skip(Config, Fun) ->

@@ -37,6 +37,7 @@
     cross_station_pubsub/4,
     cross_station_unary_rpc/4,
     put_get_content/1,
+    cross_station_put_content/2,
     cross_station_dht_put_find/3
 ]).
 
@@ -216,12 +217,25 @@ classify_find({error, _} = E, _Key) -> E.
 %% the pool, so the blob lives on the station the daemon dialled.
 -spec put_get_content(macula:pool()) -> result().
 put_get_content(Pool) ->
-    Bytes = crypto:strong_rand_bytes(8192),
-    classify_put_content(macula:put_content(Pool, Bytes), Pool, Bytes).
+    do_put_get_content(Pool, Pool).
 
-classify_put_content({ok, MCID}, Pool, Bytes) ->
-    classify_get_content(macula:get_content(Pool, MCID), Bytes);
-classify_put_content({error, _} = E, _Pool, _Bytes) ->
+%% Cross-station variant — Writer puts on one station, Reader fetches
+%% from a different one. The reader's relay handles the local miss
+%% via `_content.get_block' iterative fetch (one hop to peer
+%% stations); the writer's eager-put landed the block on the writer's
+%% relay only, so the reader has to walk out one hop.
+-spec cross_station_put_content(macula:pool(), macula:pool()) -> result().
+cross_station_put_content(WriterPool, ReaderPool) ->
+    do_put_get_content(WriterPool, ReaderPool).
+
+do_put_get_content(WriterPool, ReaderPool) ->
+    Bytes = crypto:strong_rand_bytes(8192),
+    classify_put_content(macula:put_content(WriterPool, Bytes),
+                         ReaderPool, Bytes).
+
+classify_put_content({ok, MCID}, ReaderPool, Bytes) ->
+    classify_get_content(macula:get_content(ReaderPool, MCID), Bytes);
+classify_put_content({error, _} = E, _ReaderPool, _Bytes) ->
     E.
 
 classify_get_content({ok, Bytes}, Bytes) -> ok;
