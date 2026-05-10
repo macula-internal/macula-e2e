@@ -21,7 +21,8 @@
 -include_lib("stdlib/include/assert.hrl").
 
 %% CT callbacks
--export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
+-export([suite/0, all/0, init_per_suite/1, end_per_suite/1,
+         init_per_testcase/2, end_per_testcase/2]).
 
 %% Test cases
 -export([
@@ -123,6 +124,29 @@ end_per_suite(Config) ->
 
 close_if_set(undefined) -> ok;
 close_if_set(Pool)      -> catch macula:close(Pool), ok.
+
+%%--------------------------------------------------------------------
+%% Per-testcase diagnostic capture
+%%
+%% On failure, ssh-fans into every station in `macula_e2e_fleet'
+%% and saves docker logs (windowed to the test's wall-clock duration)
+%% plus a BEAM-state snapshot under the CT case `priv_dir'. Green
+%% runs do nothing — start_capture is a noop, stop_capture sees
+%% `tc_status = ok' and returns immediately.
+%%--------------------------------------------------------------------
+
+init_per_testcase(_TestCase, Config) ->
+    Stations = macula_e2e_fleet:stations(),
+    Handle   = macula_e2e_diagnostics:start_capture(Stations),
+    [{diag_handle, Handle} | Config].
+
+end_per_testcase(TestCase, Config) ->
+    Handle  = ?config(diag_handle, Config),
+    PrivDir = ?config(priv_dir,    Config),
+    Status  = proplists:get_value(tc_status, Config, undefined),
+    catch macula_e2e_diagnostics:stop_capture(Handle, TestCase,
+                                              Status, PrivDir),
+    ok.
 
 %%====================================================================
 %% Test cases — thin wrappers over macula_e2e_probe
