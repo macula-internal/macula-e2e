@@ -39,7 +39,17 @@
     cross_station_unary_rpc/1,
     cross_station_streaming_rpc/1,
     cross_station_dht_put_find/1,
-    cross_station_put_content/1
+    cross_station_put_content/1,
+    multi_publisher_pubsub/1,
+    cross_station_multi_publisher_pubsub/1,
+    many_concurrent_calls/1,
+    cross_station_many_concurrent_calls/1,
+    many_concurrent_streams/1,
+    cross_station_many_concurrent_streams/1,
+    many_concurrent_dht_records/1,
+    cross_station_many_concurrent_dht_records/1,
+    many_concurrent_blobs/1,
+    cross_station_many_concurrent_blobs/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -69,7 +79,17 @@ all() ->
      cross_station_unary_rpc,
      cross_station_streaming_rpc,
      cross_station_dht_put_find,
-     cross_station_put_content].
+     cross_station_put_content,
+     multi_publisher_pubsub,
+     cross_station_multi_publisher_pubsub,
+     many_concurrent_calls,
+     cross_station_many_concurrent_calls,
+     many_concurrent_streams,
+     cross_station_many_concurrent_streams,
+     many_concurrent_dht_records,
+     cross_station_many_concurrent_dht_records,
+     many_concurrent_blobs,
+     cross_station_many_concurrent_blobs].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
@@ -243,6 +263,79 @@ cross_station_dht_put_find(Config) ->
 cross_station_put_content(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
         macula_e2e_probe:cross_station_put_content(Writer, Reader)
+    end).
+
+%%--------------------------------------------------------------------
+%% Concurrent / interleaved probes
+%%--------------------------------------------------------------------
+
+multi_publisher_pubsub(Config) ->
+    Pub = ?config(pool, Config),
+    Sub = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Topic = unique_topic(<<"e2e.multi.pubsub">>),
+    expect_ok(macula_e2e_probe:multi_publisher_pubsub(
+                5, 10, Pub, Sub, Realm, Topic)).
+
+cross_station_multi_publisher_pubsub(Config) ->
+    cross_or_skip(Config, fun(Pub, Sub) ->
+        Realm = ?config(test_realm, Config),
+        Topic = unique_topic(<<"e2e.cross.multi.pubsub">>),
+        macula_e2e_probe:cross_station_multi_publisher_pubsub(
+            5, 10, Pub, Sub, Realm, Topic)
+    end).
+
+many_concurrent_calls(Config) ->
+    Server = ?config(pool, Config),
+    Caller = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Procedure = unique_topic(<<"e2e.many.echo">>),
+    expect_ok(macula_e2e_probe:many_concurrent_calls(
+                10, Server, Caller, Realm, Procedure)).
+
+cross_station_many_concurrent_calls(Config) ->
+    cross_or_skip(Config, fun(Server, Caller) ->
+        Realm = ?config(test_realm, Config),
+        Procedure = unique_topic(<<"e2e.cross.many.echo">>),
+        macula_e2e_probe:cross_station_many_concurrent_calls(
+            10, Server, Caller, Realm, Procedure)
+    end).
+
+many_concurrent_streams(Config) ->
+    Server = ?config(pool, Config),
+    Caller = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Procedure = unique_topic(<<"e2e.many.streams">>),
+    expect_ok(macula_e2e_probe:many_concurrent_streams(
+                5, Server, Caller, Realm, Procedure)).
+
+cross_station_many_concurrent_streams(Config) ->
+    cross_or_skip(Config, fun(Server, Caller) ->
+        Realm = ?config(test_realm, Config),
+        Procedure = unique_topic(<<"e2e.cross.many.streams">>),
+        macula_e2e_probe:cross_station_many_concurrent_streams(
+            5, Server, Caller, Realm, Procedure)
+    end).
+
+many_concurrent_dht_records(Config) ->
+    Pool = ?config(pool, Config),
+    Realm = ?config(test_realm, Config),
+    expect_ok(macula_e2e_probe:many_concurrent_dht_records(10, Pool, Realm)).
+
+cross_station_many_concurrent_dht_records(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        Realm = ?config(test_realm, Config),
+        macula_e2e_probe:cross_station_many_concurrent_dht_records(
+            10, Writer, Reader, Realm)
+    end).
+
+many_concurrent_blobs(Config) ->
+    Pool = ?config(pool, Config),
+    expect_ok(macula_e2e_probe:many_concurrent_blobs(5, Pool)).
+
+cross_station_many_concurrent_blobs(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        macula_e2e_probe:cross_station_many_concurrent_blobs(5, Writer, Reader)
     end).
 
 cross_or_skip(Config, Fun) ->

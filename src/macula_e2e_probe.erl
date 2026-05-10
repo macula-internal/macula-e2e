@@ -37,6 +37,16 @@
     cross_station_pubsub/4,
     cross_station_unary_rpc/4,
     cross_station_streaming_rpc/4,
+    multi_publisher_pubsub/6,
+    cross_station_multi_publisher_pubsub/6,
+    many_concurrent_calls/5,
+    cross_station_many_concurrent_calls/5,
+    many_concurrent_streams/5,
+    cross_station_many_concurrent_streams/5,
+    many_concurrent_dht_records/3,
+    cross_station_many_concurrent_dht_records/4,
+    many_concurrent_blobs/2,
+    cross_station_many_concurrent_blobs/3,
     put_get_content/1,
     cross_station_put_content/2,
     cross_station_dht_put_find/3
@@ -292,6 +302,411 @@ cross_station_unary_rpc(ServerPool, CallerPool, Realm, Procedure) ->
                                   macula:procedure()) -> result().
 cross_station_streaming_rpc(ServerPool, CallerPool, Realm, Procedure) ->
     streaming_rpc(ServerPool, CallerPool, Realm, Procedure).
+
+%%====================================================================
+%% Concurrent / interleaved probes — pubsub
+%%====================================================================
+
+%% @doc N concurrent senders fire M publishes each through the same
+%% pool; a single subscriber drains; assert all N*M unique tokens
+%% land within the deadline. Stresses the relay's pubsub_server
+%% gen_server mailbox + the fan-out path under burst load. Token
+%% bytes encode (sender_idx, message_idx) so the assertion catches
+%% duplicates AND drops.
+%%
+%% Same pool for all senders (sequential publish_seq counter
+%% — the SDK's outbound_link gen_server serialises). The stress
+%% is on the RELAY side, not on signing N distinct identities.
+-spec multi_publisher_pubsub(NumSenders :: pos_integer(),
+                             MsgsPerSender :: pos_integer(),
+                             PubPool :: macula:pool(),
+                             SubPool :: macula:pool(),
+                             macula:realm(),
+                             macula:topic()) -> result().
+multi_publisher_pubsub(NumSenders, MsgsPerSender,
+                      PubPool, SubPool, Realm, Topic) ->
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Senders = [spawn_link(fun() ->
+        run_sender(I, MsgsPerSender, PubPool, Realm, Topic)
+    end) || I <- lists:seq(1, NumSenders)],
+    Total  = NumSenders * MsgsPerSender,
+    %% Drain budget: 200ms per expected event, floor 5s, ceiling
+    %% 30s. Keeps cheap tests cheap and big tests bounded.
+    Budget = max(5_000, min(30_000, Total * 200)),
+    Result = drain_unique_pubsub_events(SubRef, Total, Budget),
+    [exit(Pid, kill) || Pid <- Senders],
+    catch macula:unsubscribe(SubPool, SubRef),
+    Result.
+
+%% @doc Cross-station variant — Pub side dials one station, Sub
+%% side dials a different station. The N*M EVENTs all relay across
+%% the mesh.
+-spec cross_station_multi_publisher_pubsub(
+        pos_integer(), pos_integer(),
+        macula:pool(), macula:pool(),
+        macula:realm(), macula:topic()) -> result().
+cross_station_multi_publisher_pubsub(NumSenders, MsgsPerSender,
+                                     PubPool, SubPool, Realm, Topic) ->
+    multi_publisher_pubsub(NumSenders, MsgsPerSender,
+                           PubPool, SubPool, Realm, Topic).
+
+run_sender(SenderIdx, MsgsPerSender, Pool, Realm, Topic) ->
+    [begin
+        Token = <<SenderIdx:8, K:24>>,
+        catch macula:publish(Pool, Realm, Topic, #{<<"token">> => Token})
+     end || K <- lists:seq(1, MsgsPerSender)],
+    ok.
+
+drain_unique_pubsub_events(SubRef, Expected, TimeoutMs) ->
+    drain_unique_pubsub_events(SubRef, Expected, sets:new(),
+                               erlang:monotonic_time(millisecond) + TimeoutMs).
+
+drain_unique_pubsub_events(_SubRef, Expected, _Got, _Deadline)
+  when Expected =< 0 -> ok;
+drain_unique_pubsub_events(SubRef, Expected, Got, Deadline) ->
+    Remaining = max(1, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {macula_event, SubRef, _Topic, Payload, _Meta} ->
+            Token = extract_token(Payload),
+            NewGot = sets:add_element(Token, Got),
+            case sets:size(NewGot) - sets:size(Got) of
+                1 -> drain_unique_pubsub_events(SubRef,
+                                                Expected - 1,
+                                                NewGot, Deadline);
+                0 -> drain_unique_pubsub_events(SubRef,
+                                                Expected,
+                                                NewGot, Deadline)
+            end
+    after Remaining ->
+        {error, {missing_pubsub_events,
+                 missing, Expected,
+                 received_unique, sets:size(Got)}}
+    end.
+
+extract_token(Payload) ->
+    case normalise_keys(Payload) of
+        #{<<"token">> := T} -> T;
+        Other               -> {no_token, Other}
+    end.
+
+%%====================================================================
+%% Concurrent / interleaved probes — unary RPC
+%%====================================================================
+
+%% @doc N concurrent CALLs against one advertised proc. Each caller
+%% sends a unique correlation id; the handler echoes it; the
+%% assertion verifies each caller received its OWN correlation
+%% back (catches crossed wires in the relay's `forwarded' call_id
+%% routing map).
+-spec many_concurrent_calls(NumCalls :: pos_integer(),
+                            ServerPool :: macula:pool(),
+                            CallerPool :: macula:pool(),
+                            macula:realm(),
+                            macula:procedure()) -> result().
+many_concurrent_calls(NumCalls, ServerPool, CallerPool, Realm, Procedure) ->
+    Handler = fun(Args) -> {ok, #{<<"echo">> => Args}} end,
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    timer:sleep(?ADVERTISE_SETTLE_MS),
+    Parent = self(),
+    Callers = [spawn_link(fun() ->
+        Corr   = list_to_binary("c-" ++ integer_to_list(I)),
+        Args   = #{<<"correlation">> => Corr},
+        Reply  = macula:call(CallerPool, Realm, Procedure, Args, 10_000),
+        Parent ! {caller_done, self(), I, Corr, Reply}
+    end) || I <- lists:seq(1, NumCalls)],
+    Result = gather_caller_results(Callers, NumCalls, []),
+    catch macula:unadvertise(ServerPool, Realm, Procedure),
+    Result.
+
+%% @doc Cross-station variant — Server advertises on one station,
+%% Callers dial a DIFFERENT station. All N CALLs traverse the
+%% relay's per-call_id `forwarded' map under burst load.
+-spec cross_station_many_concurrent_calls(
+        pos_integer(), macula:pool(), macula:pool(),
+        macula:realm(), macula:procedure()) -> result().
+cross_station_many_concurrent_calls(NumCalls, ServerPool, CallerPool,
+                                    Realm, Procedure) ->
+    many_concurrent_calls(NumCalls, ServerPool, CallerPool,
+                          Realm, Procedure).
+
+gather_caller_results([], 0, Errors) ->
+    case Errors of
+        []     -> ok;
+        _      -> {error, {caller_errors, lists:reverse(Errors)}}
+    end;
+gather_caller_results(Pids, Remaining, Errors) ->
+    receive
+        {caller_done, Pid, I, Corr, Reply} ->
+            NewErrors = classify_concurrent_call(I, Corr, Reply, Errors),
+            gather_caller_results(lists:delete(Pid, Pids),
+                                  Remaining - 1, NewErrors)
+    after 30_000 ->
+        {error, {timeout_waiting_for_callers,
+                 outstanding, Remaining,
+                 partial_errors, lists:reverse(Errors)}}
+    end.
+
+classify_concurrent_call(_I, Corr, {ok, Reply}, Errors) ->
+    case normalise_keys(Reply) of
+        #{<<"echo">> := #{<<"correlation">> := Corr}} ->
+            Errors;
+        Other ->
+            [{caller_payload_mismatch, Corr, got, Other} | Errors]
+    end;
+classify_concurrent_call(I, Corr, Other, Errors) ->
+    [{caller_failed, I, Corr, Other} | Errors].
+
+%%====================================================================
+%% Concurrent / interleaved probes — streaming RPC
+%%====================================================================
+
+%% @doc N concurrent open_stream against one advertised
+%% server_stream procedure. Each caller asks for `seed' integer
+%% chunks where seed is its own ordinal; each must drain
+%% `["1", "2", ..., "<seed>"]' in order. Catches per-stream-id
+%% routing crossings in the relay's `streams' map.
+-spec many_concurrent_streams(NumStreams :: pos_integer(),
+                              ServerPool :: macula:pool(),
+                              CallerPool :: macula:pool(),
+                              macula:realm(),
+                              macula:procedure()) -> result().
+many_concurrent_streams(NumStreams, ServerPool, CallerPool,
+                        Realm, Procedure) ->
+    Handler = fun(Stream, Args) ->
+        N = case Args of
+                #{<<"n">> := X} -> X;
+                #{n         := X} -> X
+            end,
+        lists:foreach(
+          fun(I) -> ok = macula:send(Stream, integer_to_binary(I)) end,
+          lists:seq(1, N)),
+        macula:close_stream(Stream)
+    end,
+    ok = macula:advertise_stream(ServerPool, Realm, Procedure,
+                                 server_stream, Handler),
+    timer:sleep(?ADVERTISE_SETTLE_MS),
+    Parent = self(),
+    Callers = [spawn_link(fun() ->
+        N = I + 2,    % each stream has a distinct length
+        Reply = case macula:call_stream(CallerPool, Realm, Procedure,
+                                        #{<<"n">> => N}, #{}) of
+                    {ok, Stream}     -> drain_stream(Stream, []);
+                    {error, _} = E   -> E
+                end,
+        Parent ! {stream_done, self(), I, N, Reply}
+    end) || I <- lists:seq(1, NumStreams)],
+    Result = gather_stream_results(Callers, NumStreams, []),
+    catch macula:unadvertise_stream(ServerPool, Realm, Procedure),
+    Result.
+
+-spec cross_station_many_concurrent_streams(
+        pos_integer(), macula:pool(), macula:pool(),
+        macula:realm(), macula:procedure()) -> result().
+cross_station_many_concurrent_streams(NumStreams, ServerPool, CallerPool,
+                                      Realm, Procedure) ->
+    many_concurrent_streams(NumStreams, ServerPool, CallerPool,
+                            Realm, Procedure).
+
+gather_stream_results([], 0, Errors) ->
+    case Errors of
+        [] -> ok;
+        _  -> {error, {stream_errors, lists:reverse(Errors)}}
+    end;
+gather_stream_results(Pids, Remaining, Errors) ->
+    receive
+        {stream_done, Pid, I, N, Reply} ->
+            NewErrors = classify_concurrent_stream(I, N, Reply, Errors),
+            gather_stream_results(lists:delete(Pid, Pids),
+                                  Remaining - 1, NewErrors)
+    after 30_000 ->
+        {error, {timeout_waiting_for_streams,
+                 outstanding, Remaining,
+                 partial_errors, lists:reverse(Errors)}}
+    end.
+
+classify_concurrent_stream(I, N, {ok, Chunks}, Errors) ->
+    Expected = [integer_to_binary(K) || K <- lists:seq(1, N)],
+    case Chunks =:= Expected of
+        true  -> Errors;
+        false -> [{stream_chunks_mismatch, I, expected, Expected,
+                   got, Chunks} | Errors]
+    end;
+classify_concurrent_stream(I, _N, Other, Errors) ->
+    [{stream_failed, I, Other} | Errors].
+
+%%====================================================================
+%% Concurrent / interleaved probes — DHT
+%%====================================================================
+
+%% @doc N concurrent put_record calls; after replication delay, find
+%% each record back. Asserts every put becomes a successful find.
+%% Single-pool variant — both sides of the round-trip on the same
+%% station.
+-spec many_concurrent_dht_records(NumRecords :: pos_integer(),
+                                  macula:pool(),
+                                  macula:realm()) -> result().
+many_concurrent_dht_records(NumRecords, Pool, Realm) ->
+    do_many_concurrent_dht_records(NumRecords, Pool, Pool, Realm).
+
+%% @doc Cross-station variant — Writer puts on one station, Reader
+%% finds on a different station. Stresses the eager-replication
+%% (k=8) + 1-hop iterative fallback path under burst load.
+-spec cross_station_many_concurrent_dht_records(
+        pos_integer(), macula:pool(), macula:pool(),
+        macula:realm()) -> result().
+cross_station_many_concurrent_dht_records(NumRecords, WriterPool,
+                                          ReaderPool, Realm) ->
+    do_many_concurrent_dht_records(NumRecords, WriterPool,
+                                   ReaderPool, Realm).
+
+do_many_concurrent_dht_records(NumRecords, WriterPool, ReaderPool, Realm) ->
+    Records = [begin
+        Identity = macula_identity:generate(),
+        NodeId   = macula_identity:public(Identity),
+        Record   = macula_record:node_record(NodeId, [Realm], 0),
+        Signed   = macula_record:sign(Record, Identity),
+        {macula_record:storage_key(Signed), Signed}
+    end || _ <- lists:seq(1, NumRecords)],
+    Parent = self(),
+    Writers = [spawn_link(fun() ->
+        R = macula:put_record(WriterPool, Signed),
+        Parent ! {put_done, self(), Key, R}
+    end) || {Key, Signed} <- Records],
+    PutErrors = gather_put_results(Writers, NumRecords, []),
+    timer:sleep(?DHT_REPLICATION_MS),
+    case PutErrors of
+        [] ->
+            FindErrors = run_concurrent_finds(ReaderPool,
+                                              [Key || {Key, _} <- Records]),
+            classify_dht_concurrency([], FindErrors);
+        _ ->
+            classify_dht_concurrency(PutErrors, [])
+    end.
+
+gather_put_results([], 0, Errors) -> lists:reverse(Errors);
+gather_put_results(Pids, Remaining, Errors) ->
+    receive
+        {put_done, Pid, _Key, ok} ->
+            gather_put_results(lists:delete(Pid, Pids),
+                               Remaining - 1, Errors);
+        {put_done, Pid, Key, {error, Reason}} ->
+            gather_put_results(lists:delete(Pid, Pids),
+                               Remaining - 1,
+                               [{put_failed, Key, Reason} | Errors])
+    after 30_000 ->
+        [{put_timeout, outstanding, Remaining} | lists:reverse(Errors)]
+    end.
+
+run_concurrent_finds(ReaderPool, Keys) ->
+    Parent = self(),
+    Finders = [spawn_link(fun() ->
+        R = macula:find_record(ReaderPool, Key),
+        Parent ! {find_done, self(), Key, R}
+    end) || Key <- Keys],
+    gather_find_results(Finders, length(Keys), []).
+
+gather_find_results([], 0, Errors) -> lists:reverse(Errors);
+gather_find_results(Pids, Remaining, Errors) ->
+    receive
+        {find_done, Pid, _Key, {ok, _}} ->
+            gather_find_results(lists:delete(Pid, Pids),
+                                Remaining - 1, Errors);
+        {find_done, Pid, Key, Other} ->
+            gather_find_results(lists:delete(Pid, Pids),
+                                Remaining - 1,
+                                [{find_failed, Key, Other} | Errors])
+    after 30_000 ->
+        [{find_timeout, outstanding, Remaining} | lists:reverse(Errors)]
+    end.
+
+classify_dht_concurrency([], []) -> ok;
+classify_dht_concurrency(PutErrors, FindErrors) ->
+    {error, #{put_errors  => PutErrors,
+              find_errors => FindErrors}}.
+
+%%====================================================================
+%% Concurrent / interleaved probes — content sharing
+%%====================================================================
+
+%% @doc N concurrent put_content calls; after replication delay,
+%% get each content back; assert byte-for-byte match. Single-pool
+%% variant.
+-spec many_concurrent_blobs(NumBlobs :: pos_integer(),
+                            macula:pool()) -> result().
+many_concurrent_blobs(NumBlobs, Pool) ->
+    do_many_concurrent_blobs(NumBlobs, Pool, Pool).
+
+%% @doc Cross-station variant — Writer puts on one station, Reader
+%% fetches from a different one. Stresses content's eager k=3
+%% replication + 1-hop iterative fetch under burst load.
+-spec cross_station_many_concurrent_blobs(
+        pos_integer(), macula:pool(), macula:pool()) -> result().
+cross_station_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool) ->
+    do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool).
+
+do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool) ->
+    Blobs = [{N, crypto:strong_rand_bytes(8192)}
+             || N <- lists:seq(1, NumBlobs)],
+    Parent = self(),
+    Writers = [spawn_link(fun() ->
+        R = macula:put_content(WriterPool, Bytes),
+        Parent ! {blob_put_done, self(), N, Bytes, R}
+    end) || {N, Bytes} <- Blobs],
+    Mcids = gather_blob_puts(Writers, NumBlobs, []),
+    case Mcids of
+        {error, _} = E -> E;
+        Pairs ->
+            timer:sleep(?DHT_REPLICATION_MS),
+            run_concurrent_gets(ReaderPool, Pairs)
+    end.
+
+gather_blob_puts([], 0, Acc) -> lists:reverse(Acc);
+gather_blob_puts(Pids, Remaining, Acc) ->
+    receive
+        {blob_put_done, Pid, N, Bytes, {ok, MCID}} ->
+            gather_blob_puts(lists:delete(Pid, Pids),
+                             Remaining - 1,
+                             [{N, MCID, Bytes} | Acc]);
+        {blob_put_done, _Pid, N, _Bytes, Other} ->
+            {error, {blob_put_failed, N, Other,
+                     remaining, Remaining - 1,
+                     completed, length(Acc)}}
+    after 30_000 ->
+        {error, {blob_put_timeout, outstanding, Remaining,
+                 completed, length(Acc)}}
+    end.
+
+run_concurrent_gets(ReaderPool, Pairs) ->
+    Parent = self(),
+    Getters = [spawn_link(fun() ->
+        R = macula:get_content(ReaderPool, MCID),
+        Parent ! {blob_get_done, self(), N, Bytes, R}
+    end) || {N, MCID, Bytes} <- Pairs],
+    gather_blob_gets(Getters, length(Pairs), []).
+
+gather_blob_gets([], 0, Errors) ->
+    case Errors of
+        [] -> ok;
+        _  -> {error, {blob_get_errors, lists:reverse(Errors)}}
+    end;
+gather_blob_gets(Pids, Remaining, Errors) ->
+    receive
+        {blob_get_done, Pid, _N, Bytes, {ok, Got}} when Got =:= Bytes ->
+            gather_blob_gets(lists:delete(Pid, Pids),
+                             Remaining - 1, Errors);
+        {blob_get_done, Pid, N, _Bytes, {ok, Other}} ->
+            gather_blob_gets(lists:delete(Pid, Pids),
+                             Remaining - 1,
+                             [{blob_byte_mismatch, N,
+                               size(Other)} | Errors]);
+        {blob_get_done, Pid, N, _Bytes, Other} ->
+            gather_blob_gets(lists:delete(Pid, Pids),
+                             Remaining - 1,
+                             [{blob_get_failed, N, Other} | Errors])
+    after 30_000 ->
+        [{blob_get_timeout, outstanding, Remaining} | lists:reverse(Errors)]
+    end.
 
 %% @doc Cross-station DHT roundtrip. WriterPool puts through one
 %% station; ReaderPool finds through a DIFFERENT station. The record
