@@ -36,6 +36,7 @@
     pool_close_cleanup/1,
     cross_station_pubsub/4,
     cross_station_unary_rpc/4,
+    cross_station_streaming_rpc/4,
     put_get_content/1,
     cross_station_put_content/2,
     cross_station_dht_put_find/3
@@ -277,6 +278,20 @@ cross_station_pubsub(PubPool, SubPool, Realm, Topic) ->
                               macula:procedure()) -> result().
 cross_station_unary_rpc(ServerPool, CallerPool, Realm, Procedure) ->
     unary_rpc(ServerPool, CallerPool, Realm, Procedure).
+
+%% @doc Cross-station streaming RPC roundtrip. Server advertises a
+%% server_stream procedure on one station; Caller opens the stream
+%% from a DIFFERENT station. Frames flow across the relay's
+%% per-stream-id forwarding map (macula-station commit fa32bbd —
+%% STREAM_OPEN routes by procedure like CALL, subsequent
+%% STREAM_DATA / STREAM_END / STREAM_ERROR / STREAM_REPLY frames
+%% relay by stream-id).
+-spec cross_station_streaming_rpc(ServerPool :: macula:pool(),
+                                  CallerPool :: macula:pool(),
+                                  macula:realm(),
+                                  macula:procedure()) -> result().
+cross_station_streaming_rpc(ServerPool, CallerPool, Realm, Procedure) ->
+    streaming_rpc(ServerPool, CallerPool, Realm, Procedure).
 
 %% @doc Cross-station DHT roundtrip. WriterPool puts through one
 %% station; ReaderPool finds through a DIFFERENT station. The record

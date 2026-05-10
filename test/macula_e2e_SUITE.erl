@@ -37,6 +37,7 @@
     put_get_content/1,
     cross_station_pubsub/1,
     cross_station_unary_rpc/1,
+    cross_station_streaming_rpc/1,
     cross_station_dht_put_find/1,
     cross_station_put_content/1
 ]).
@@ -66,6 +67,7 @@ all() ->
      %% is set. Each tc skips cleanly when the second pool isn't wired.
      cross_station_pubsub,
      cross_station_unary_rpc,
+     cross_station_streaming_rpc,
      cross_station_dht_put_find,
      cross_station_put_content].
 
@@ -222,6 +224,14 @@ cross_station_unary_rpc(Config) ->
         Procedure = unique_topic(<<"e2e.cross.echo">>),
         macula_e2e_probe:cross_station_unary_rpc(Server, Caller,
                                                   Realm, Procedure)
+    end).
+
+cross_station_streaming_rpc(Config) ->
+    cross_or_skip(Config, fun(Server, Caller) ->
+        Realm = ?config(test_realm, Config),
+        Procedure = unique_topic(<<"e2e.cross.stream">>),
+        macula_e2e_probe:cross_station_streaming_rpc(Server, Caller,
+                                                      Realm, Procedure)
     end).
 
 cross_station_dht_put_find(Config) ->
