@@ -47,6 +47,10 @@
     cross_station_many_concurrent_dht_records/4,
     many_concurrent_blobs/2,
     cross_station_many_concurrent_blobs/3,
+    tombstone_propagation/2,
+    cross_station_tombstone_propagation/3,
+    subscribe_records_local/2,
+    subscribe_records_cross_station/3,
     put_get_content/1,
     cross_station_put_content/2,
     cross_station_dht_put_find/3
@@ -706,6 +710,160 @@ gather_blob_gets(Pids, Remaining, Errors) ->
                              [{blob_get_failed, N, Other} | Errors])
     after 30_000 ->
         [{blob_get_timeout, outstanding, Remaining} | lists:reverse(Errors)]
+    end.
+
+%%====================================================================
+%% DNS-readiness probes — tombstone propagation latency
+%%====================================================================
+
+%% @doc Single-station tombstone propagation. Same pool puts the
+%% record then the tombstone; the reader on the same station polls
+%% find_record and measures time-to-tombstone-visible.
+-spec tombstone_propagation(macula:pool(), macula:realm()) -> result().
+tombstone_propagation(Pool, Realm) ->
+    do_tombstone_propagation(Pool, Pool, Realm, 60_000).
+
+%% @doc Cross-station tombstone propagation — Writer puts on one
+%% station, then puts the tombstone; Reader on a DIFFERENT station
+%% polls. Measures the cross-station replication path's tombstone
+%% propagation latency. Target for DNS: p95 ≤ 30s (gives 30s
+%% headroom on DNS-over-mesh's 60s success criterion).
+-spec cross_station_tombstone_propagation(macula:pool(), macula:pool(),
+                                          macula:realm()) -> result().
+cross_station_tombstone_propagation(WriterPool, ReaderPool, Realm) ->
+    do_tombstone_propagation(WriterPool, ReaderPool, Realm, 60_000).
+
+do_tombstone_propagation(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
+    Identity = macula_identity:generate(),
+    NodeId   = macula_identity:public(Identity),
+    Record   = macula_record:node_record(NodeId, [Realm], 0),
+    Signed   = macula_record:sign(Record, Identity),
+    Key      = macula_record:storage_key(Signed),
+    case macula:put_record(WriterPool, Signed) of
+        ok ->
+            timer:sleep(?DHT_REPLICATION_MS),
+            case wait_until_visible(ReaderPool, Key, fun is_node_record/1, 10_000) of
+                ok ->
+                    Tombstone = macula_record:sign(
+                        macula_record:tombstone(NodeId,
+                            macula_record_type_node_record(),
+                            superseded), Identity),
+                    PutAt = erlang:monotonic_time(millisecond),
+                    case macula:put_record(WriterPool, Tombstone) of
+                        ok ->
+                            classify_tombstone_visible(
+                                wait_until_visible(ReaderPool, Key,
+                                                   fun is_tombstone/1, MaxWaitMs),
+                                erlang:monotonic_time(millisecond) - PutAt);
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E -> {error, {original_not_visible, E}}
+            end;
+        {error, _} = E -> E
+    end.
+
+classify_tombstone_visible(ok, LatencyMs) ->
+    %% Returning the latency in `ok' tuple lets a future test assert
+    %% on a threshold; CT case currently only treats this as ok|error.
+    {ok, LatencyMs};
+classify_tombstone_visible({error, Reason}, _) ->
+    {error, {tombstone_not_visible, Reason}}.
+
+%% Hardcoded: 0x01 = ?TYPE_NODE_RECORD per macula_record.erl.
+%% Avoids depending on a non-exported macro.
+macula_record_type_node_record() -> 16#01.
+
+%% Poll find_record at 250ms intervals until Pred(Record) returns
+%% true or MaxWaitMs elapses. Used both for "wait until original
+%% visible" and "wait until tombstone visible".
+wait_until_visible(Pool, Key, Pred, MaxWaitMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + MaxWaitMs,
+    wait_until_visible_loop(Pool, Key, Pred, Deadline).
+
+wait_until_visible_loop(Pool, Key, Pred, Deadline) ->
+    case macula:find_record(Pool, Key) of
+        {ok, Rec} ->
+            case Pred(Rec) of
+                true  -> ok;
+                false ->
+                    sleep_or_timeout(Pool, Key, Pred, Deadline)
+            end;
+        _NotFoundOrError ->
+            sleep_or_timeout(Pool, Key, Pred, Deadline)
+    end.
+
+sleep_or_timeout(Pool, Key, Pred, Deadline) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        true  -> {error, {wait_until_visible_timeout, Key}};
+        false -> timer:sleep(250),
+                 wait_until_visible_loop(Pool, Key, Pred, Deadline)
+    end.
+
+is_node_record(#{type := T}) when T =:= 16#01 -> true;
+is_node_record(_)                             -> false.
+
+is_tombstone(#{type := T}) when T =:= 16#0C -> true;
+is_tombstone(_)                             -> false.
+
+%%====================================================================
+%% DNS-readiness probes — subscribe_records semantics
+%%====================================================================
+
+%% @doc Single-station baseline: SubPool subscribes to records of
+%% type 0x01 (node_record); WriterPool puts a record of that type;
+%% assert subscriber's callback fires within bounded window. Same
+%% pool variant — confirms the local subscribe path works at all.
+-spec subscribe_records_local(macula:pool(), macula:realm()) -> result().
+subscribe_records_local(Pool, Realm) ->
+    do_subscribe_records(Pool, Pool, Realm, 5_000).
+
+%% @doc Cross-station: WriterPool puts on one station; SubPool
+%% subscribes from a DIFFERENT station; assert the callback fires
+%% within 10s. The DNS slice's `on_record_observed_invalidate_cache'
+%% PM depends on this firing for cross-station-replicated records;
+%% if it doesn't, the cache-invalidation logic is structurally
+%% broken and the slice serves stale records forever.
+-spec subscribe_records_cross_station(macula:pool(), macula:pool(),
+                                      macula:realm()) -> result().
+subscribe_records_cross_station(WriterPool, ReaderPool, Realm) ->
+    do_subscribe_records(WriterPool, ReaderPool, Realm, 10_000).
+
+do_subscribe_records(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
+    Self = self(),
+    Tag  = make_ref(),
+    Callback = fun(Rec) -> Self ! {sub_record, Tag, Rec} end,
+    case macula:subscribe_records(ReaderPool,
+                                  macula_record_type_node_record(),
+                                  Callback) of
+        {ok, SubRef} ->
+            timer:sleep(?SUBSCRIBE_SETTLE_MS),
+            Identity = macula_identity:generate(),
+            NodeId   = macula_identity:public(Identity),
+            Record   = macula_record:node_record(NodeId, [Realm], 0),
+            Signed   = macula_record:sign(Record, Identity),
+            Key      = macula_record:storage_key(Signed),
+            PutAt    = erlang:monotonic_time(millisecond),
+            Result =
+                case macula:put_record(WriterPool, Signed) of
+                    ok ->
+                        await_record_callback(Tag, Key, PutAt, MaxWaitMs);
+                    {error, _} = E -> E
+                end,
+            catch macula:unsubscribe_records(ReaderPool, SubRef),
+            Result;
+        {error, _} = E -> {error, {subscribe_failed, E}}
+    end.
+
+await_record_callback(Tag, ExpectedKey, PutAt, TimeoutMs) ->
+    receive
+        {sub_record, Tag, #{key := Key} = _Rec}
+          when Key =:= ExpectedKey ->
+            {ok, erlang:monotonic_time(millisecond) - PutAt};
+        {sub_record, Tag, _OtherRec} ->
+            %% Some other record observation — ignore + keep waiting.
+            await_record_callback(Tag, ExpectedKey, PutAt, TimeoutMs)
+    after TimeoutMs ->
+        {error, {no_record_callback_within_ms, TimeoutMs}}
     end.
 
 %% @doc Cross-station DHT roundtrip. WriterPool puts through one

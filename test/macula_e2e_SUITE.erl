@@ -49,7 +49,11 @@
     many_concurrent_dht_records/1,
     cross_station_many_concurrent_dht_records/1,
     many_concurrent_blobs/1,
-    cross_station_many_concurrent_blobs/1
+    cross_station_many_concurrent_blobs/1,
+    tombstone_propagation/1,
+    cross_station_tombstone_propagation/1,
+    subscribe_records_local/1,
+    subscribe_records_cross_station/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -89,7 +93,11 @@ all() ->
      many_concurrent_dht_records,
      cross_station_many_concurrent_dht_records,
      many_concurrent_blobs,
-     cross_station_many_concurrent_blobs].
+     cross_station_many_concurrent_blobs,
+     tombstone_propagation,
+     cross_station_tombstone_propagation,
+     subscribe_records_local,
+     subscribe_records_cross_station].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
@@ -336,6 +344,52 @@ many_concurrent_blobs(Config) ->
 cross_station_many_concurrent_blobs(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
         macula_e2e_probe:cross_station_many_concurrent_blobs(5, Writer, Reader)
+    end).
+
+tombstone_propagation(Config) ->
+    Pool = ?config(pool, Config),
+    Realm = ?config(test_realm, Config),
+    case macula_e2e_probe:tombstone_propagation(Pool, Realm) of
+        {ok, LatencyMs} ->
+            ct:pal("[e2e] tombstone propagation latency: ~p ms", [LatencyMs]),
+            ok;
+        {error, _} = E -> ct:fail(E)
+    end.
+
+cross_station_tombstone_propagation(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        Realm = ?config(test_realm, Config),
+        case macula_e2e_probe:cross_station_tombstone_propagation(
+                Writer, Reader, Realm) of
+            {ok, LatencyMs} ->
+                ct:pal("[e2e] cross-station tombstone latency: ~p ms",
+                       [LatencyMs]),
+                ok;
+            {error, _} = E -> E
+        end
+    end).
+
+subscribe_records_local(Config) ->
+    Pool = ?config(pool, Config),
+    Realm = ?config(test_realm, Config),
+    case macula_e2e_probe:subscribe_records_local(Pool, Realm) of
+        {ok, LatencyMs} ->
+            ct:pal("[e2e] local subscribe_records latency: ~p ms", [LatencyMs]),
+            ok;
+        {error, _} = E -> ct:fail(E)
+    end.
+
+subscribe_records_cross_station(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        Realm = ?config(test_realm, Config),
+        case macula_e2e_probe:subscribe_records_cross_station(
+                Writer, Reader, Realm) of
+            {ok, LatencyMs} ->
+                ct:pal("[e2e] cross-station subscribe_records latency: ~p ms",
+                       [LatencyMs]),
+                ok;
+            {error, _} = E -> E
+        end
     end).
 
 cross_or_skip(Config, Fun) ->
