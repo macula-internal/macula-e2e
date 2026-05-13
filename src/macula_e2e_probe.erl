@@ -57,7 +57,15 @@
 ]).
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
--define(ADVERTISE_SETTLE_MS,  1_500).
+%% Bumped 1500 -> 3000 on 2026-05-13. The macula-station 4.x ADVERTISE
+%% propagation path is bounded by peer_observer's gen_server mailbox
+%% dispatch latency, which under live-fleet DHT load (~85% of inbound
+%% frames are `_dht.put_record' store/store_ack chatter) is ~700-1000 ms
+%% per call on each side of a cross-station hop. The router-queue
+%% bottleneck was fixed by macula-station commit d0f0c8a (ETS bypass);
+%% peer_observer mailbox depth is the residual ceiling. 1500 ms is on
+%% the edge; 3000 ms gives margin until the DHT chatter is throttled.
+-define(ADVERTISE_SETTLE_MS,  3_000).
 -define(DHT_REPLICATION_MS,   2_000).
 
 -type result() :: ok | {error, Reason :: term()}.
