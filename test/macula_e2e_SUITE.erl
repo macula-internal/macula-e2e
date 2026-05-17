@@ -59,7 +59,14 @@
     pubsub_sustained_mpong/1,
     cross_station_pubsub_sustained_mpong/1,
     pubsub_io_macula_realm_simple/1,
-    pubsub_test_realm_mpong_payload/1
+    pubsub_test_realm_mpong_payload/1,
+    pubsub_axis_atom_keys_only/1,
+    pubsub_axis_int_keys_only/1,
+    pubsub_axis_neg_ints_only/1,
+    pubsub_axis_int_keys_neg_ints/1,
+    pubsub_axis_atom_keys_neg_ints/1,
+    pubsub_mpong_diag/1,
+    cross_station_pubsub_mpong_diag/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -119,7 +126,19 @@ all() ->
      %% problem — interaction with topic prefix or realm membership
      %% would be the next suspect.
      pubsub_io_macula_realm_simple,
-     pubsub_test_realm_mpong_payload].
+     pubsub_test_realm_mpong_payload,
+     %% Fine-grained axis isolation: each test exercises one wire
+     %% feature in isolation. See `macula_e2e_mpong:axis_payload/2'.
+     pubsub_axis_atom_keys_only,
+     pubsub_axis_int_keys_only,
+     pubsub_axis_neg_ints_only,
+     pubsub_axis_int_keys_neg_ints,
+     pubsub_axis_atom_keys_neg_ints,
+     %% Deep-diag: sentinel + suspect + sentinel sandwich. Splits
+     %% "wire down" vs "payload silently dropped" vs "publish path
+     %% died after suspect" failure modes.
+     pubsub_mpong_diag,
+     cross_station_pubsub_mpong_diag].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
@@ -482,6 +501,60 @@ pubsub_test_realm_mpong_payload(Config) ->
     Realm = ?config(test_realm, Config),      %% _test
     Topic = unique_topic(<<"e2e.test_realm.mpong">>),
     expect_ok(macula_e2e_probe:pubsub_mpong_shape(Pub, Sub, Realm, Topic)).
+
+%%--------------------------------------------------------------------
+%% Axis-isolation tests — one wire feature at a time.
+%%--------------------------------------------------------------------
+
+pubsub_axis_atom_keys_only(Config) ->        run_axis(Config, atom_keys_only).
+pubsub_axis_int_keys_only(Config) ->         run_axis(Config, int_keys_only).
+pubsub_axis_neg_ints_only(Config) ->         run_axis(Config, neg_ints_only).
+pubsub_axis_int_keys_neg_ints(Config) ->     run_axis(Config, int_keys_neg_ints).
+pubsub_axis_atom_keys_neg_ints(Config) ->    run_axis(Config, atom_keys_neg_ints).
+
+run_axis(Config, Axis) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    AxisBin = atom_to_binary(Axis, utf8),
+    Topic = unique_topic(<<"e2e.axis.", AxisBin/binary>>),
+    expect_ok(macula_e2e_probe:pubsub_payload_axis(Axis, Pub, Sub, Realm, Topic)).
+
+%%--------------------------------------------------------------------
+%% Deep-diag — sentinel + suspect + sentinel.
+%% Result on failure is a {error, Tag, Report} tuple with the
+%% reception state for each event + pool status snapshots, so a
+%% CT failure surfaces the diagnostic context inline.
+%%--------------------------------------------------------------------
+
+pubsub_mpong_diag(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(weather_realm, Config),
+    Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                            "state_broadcast_v1.e2e.diag">>),
+    case macula_e2e_probe:pubsub_mpong_diag(Pub, Sub, Realm, Topic) of
+        ok ->
+            ok;
+        {error, {Tag, Report}} ->
+            ct:pal("[e2e][mpong-diag] ~p: ~p", [Tag, Report]),
+            ct:fail({mpong_diag, Tag})
+    end.
+
+cross_station_pubsub_mpong_diag(Config) ->
+    cross_or_skip(Config, fun(Pub, Sub) ->
+        Realm = ?config(weather_realm, Config),
+        Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                                "state_broadcast_v1.e2e.cross.diag">>),
+        case macula_e2e_probe:cross_station_pubsub_mpong_diag(
+                Pub, Sub, Realm, Topic) of
+            ok ->
+                ok;
+            {error, {Tag, Report}} ->
+                ct:pal("[e2e][mpong-diag-cross] ~p: ~p", [Tag, Report]),
+                {error, {mpong_diag_cross, Tag}}
+        end
+    end).
 
 cross_or_skip(Config, Fun) ->
     case ?config(cross, Config) of

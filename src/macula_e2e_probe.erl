@@ -57,7 +57,11 @@
     pubsub_mpong_shape/4,
     cross_station_pubsub_mpong_shape/4,
     pubsub_sustained_mpong/6,
-    cross_station_pubsub_sustained_mpong/6
+    cross_station_pubsub_sustained_mpong/6,
+    pubsub_payload_axis/5,
+    cross_station_pubsub_payload_axis/5,
+    pubsub_mpong_diag/4,
+    cross_station_pubsub_mpong_diag/4
 ]).
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
@@ -936,8 +940,10 @@ pool_close_cleanup(Bootstrap) ->
 -define(SUSTAINED_DRAIN_GRACE_MS, 5_000).
 
 %% @doc Single mpong-shape roundtrip on the `io.macula' realm.
-%% Asserts the wire encode/decode survives integer map keys and
-%% negative integers under the production realm key.
+%% Uses the production-faithful payload from `macula_e2e_mpong:
+%% state_payload/1' — atom keys throughout, integer-keyed nested
+%% maps in `paddles' / `alive' / `points', negative ints in
+%% the ball velocity, plus the double-keyed `game_id'.
 -spec pubsub_mpong_shape(PubPool :: macula:pool(),
                          SubPool :: macula:pool(),
                          macula:realm(),
@@ -945,7 +951,7 @@ pool_close_cleanup(Bootstrap) ->
 pubsub_mpong_shape(PubPool, SubPool, Realm, Topic) ->
     {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
     timer:sleep(?SUBSCRIBE_SETTLE_MS),
-    Payload = mpong_state_payload(1),
+    Payload = macula_e2e_mpong:state_payload(1),
     ok = macula:publish(PubPool, Realm, Topic, Payload),
     Result = await_event_match(SubRef, Topic, Payload, 5_000),
     catch macula:unsubscribe(SubPool, SubRef),
@@ -1004,28 +1010,158 @@ cross_station_pubsub_sustained_mpong(PubPool, SubPool, Realm, Topic,
                                      Rate, DurationMs) ->
     pubsub_sustained_mpong(PubPool, SubPool, Realm, Topic, Rate, DurationMs).
 
-%% Mpong-shape payload. The integer map keys (0, 1) in `score' /
-%% `paddles' and the negative integer in `vx' are the two CBOR
-%% wire-format extensions the daemon's broadcast path needs and
-%% that macula 4.4.10 added support for in the encode/decode path.
-%% `token' carries the tick so the assertion can dedupe in the
-%% sustained drain.
-mpong_state_payload(Tick) ->
-    #{
-        <<"token">>   => integer_to_binary(Tick),
-        <<"tick">>    => Tick,
-        <<"game_id">> => <<"e2e-mpong">>,
-        <<"score">>   => #{0 => Tick rem 11, 1 => (Tick * 7) rem 11},
-        <<"ball">>    => #{<<"x">>  => 500, <<"y">>  => 300,
-                           <<"vx">> =>  -3, <<"vy">> =>   2},
-        <<"paddles">> => #{0 => 498, 1 => 500}
-    }.
-
 run_sustained_sender(_Pool, _Realm, _Topic, 0, _IntervalMs) -> ok;
 run_sustained_sender(Pool, Realm, Topic, N, IntervalMs) ->
-    catch macula:publish(Pool, Realm, Topic, mpong_state_payload(N)),
+    catch macula:publish(Pool, Realm, Topic, macula_e2e_mpong:state_payload(N)),
     timer:sleep(IntervalMs),
     run_sustained_sender(Pool, Realm, Topic, N - 1, IntervalMs).
+
+%%====================================================================
+%% Axis-isolation probes
+%%
+%% Each call exercises one wire feature of the full mpong state
+%% payload in isolation. When the sustained / mpong-shape probes
+%% fail and the simple `pubsub_roundtrip' passes, these narrow
+%% down which feature breaks delivery (atom keys, integer keys,
+%% negative ints, or some combination). See
+%% `macula_e2e_mpong:axis_payload/2' for the per-axis shapes.
+%%====================================================================
+
+-spec pubsub_payload_axis(Axis :: atom(),
+                          PubPool :: macula:pool(),
+                          SubPool :: macula:pool(),
+                          macula:realm(),
+                          macula:topic()) -> result().
+pubsub_payload_axis(Axis, PubPool, SubPool, Realm, Topic) ->
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Payload = macula_e2e_mpong:axis_payload(Axis, 1),
+    ok = macula:publish(PubPool, Realm, Topic, Payload),
+    Result = await_event_match(SubRef, Topic, Payload, 5_000),
+    catch macula:unsubscribe(SubPool, SubRef),
+    Result.
+
+-spec cross_station_pubsub_payload_axis(Axis :: atom(),
+                                        PubPool :: macula:pool(),
+                                        SubPool :: macula:pool(),
+                                        macula:realm(),
+                                        macula:topic()) -> result().
+cross_station_pubsub_payload_axis(Axis, PubPool, SubPool, Realm, Topic) ->
+    pubsub_payload_axis(Axis, PubPool, SubPool, Realm, Topic).
+
+%%====================================================================
+%% Deep-diagnose probe — sentinel + suspect + sentinel
+%%
+%% Diagnoses the mpong delivery gap by sandwiching the suspect mpong
+%% payload between two known-good "sentinel" payloads. The sentinel
+%% is a plain binary-keyed map that the simple `pubsub_roundtrip'
+%% pattern delivers reliably. Reporting:
+%%
+%%   - Both sentinels + mpong delivered → the gap is closed
+%%   - Both sentinels delivered, mpong missing → wire is alive at
+%%     publish time; payload shape silently breaks delivery
+%%     (server-side relay, dedup, or decode)
+%%   - Only sentinel-A delivered → mpong crashed the publish path
+%%     (e.g. encoder function_clause that kills the link)
+%%   - Neither sentinel → wire was not up at all; probe environment
+%%     issue, not a payload bug
+%%
+%% Also captures `macula:status/1' for both pools before+after the
+%% publish phase so the report includes link health snapshots.
+%%====================================================================
+
+-spec pubsub_mpong_diag(PubPool :: macula:pool(),
+                        SubPool :: macula:pool(),
+                        macula:realm(),
+                        macula:topic()) -> result().
+pubsub_mpong_diag(PubPool, SubPool, Realm, Topic) ->
+    PreStatusPub = macula:status(PubPool),
+    PreStatusSub = macula:status(SubPool),
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    SentinelA = sentinel_payload(<<"sentinel-a">>),
+    Suspect   = macula_e2e_mpong:state_payload(1),
+    SentinelB = sentinel_payload(<<"sentinel-b">>),
+    ok = macula:publish(PubPool, Realm, Topic, SentinelA),
+    ok = macula:publish(PubPool, Realm, Topic, Suspect),
+    ok = macula:publish(PubPool, Realm, Topic, SentinelB),
+    Window = collect_mpong_diag_events(SubRef, 8_000),
+    PostStatusPub = macula:status(PubPool),
+    catch macula:unsubscribe(SubPool, SubRef),
+    classify_mpong_diag(Window, #{
+        pre_pub_status  => PreStatusPub,
+        pre_sub_status  => PreStatusSub,
+        post_pub_status => PostStatusPub,
+        sent_a_token    => maps:get(<<"token">>, SentinelA),
+        suspect_token   => maps:get(<<"token">>, Suspect),
+        sent_b_token    => maps:get(<<"token">>, SentinelB)
+    }).
+
+-spec cross_station_pubsub_mpong_diag(PubPool :: macula:pool(),
+                                      SubPool :: macula:pool(),
+                                      macula:realm(),
+                                      macula:topic()) -> result().
+cross_station_pubsub_mpong_diag(PubPool, SubPool, Realm, Topic) ->
+    pubsub_mpong_diag(PubPool, SubPool, Realm, Topic).
+
+%% A sentinel is a simple binary-keyed map. `pubsub_roundtrip' uses
+%% the same shape and is known to deliver via the current fleet —
+%% so a missing sentinel is a hard signal that the wire is not up,
+%% not a subtle payload-shape issue.
+sentinel_payload(Tag) when is_binary(Tag) ->
+    #{<<"token">> => Tag, <<"kind">> => <<"sentinel">>}.
+
+%% Drain every {macula_event, ...} that comes in within TimeoutMs,
+%% recording tokens AND payloads (the latter for the report on
+%% partial deliveries). Returns the ordered list of (token, payload)
+%% tuples actually received.
+collect_mpong_diag_events(SubRef, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    collect_mpong_diag_events(SubRef, Deadline, []).
+
+collect_mpong_diag_events(SubRef, Deadline, Acc) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true -> lists:reverse(Acc);
+        false ->
+            receive
+                {macula_event, SubRef, _Topic, Payload, _Meta} ->
+                    Token = extract_token(Payload),
+                    collect_mpong_diag_events(
+                        SubRef, Deadline,
+                        [{Token, Payload} | Acc])
+            after Remaining ->
+                lists:reverse(Acc)
+            end
+    end.
+
+classify_mpong_diag(Events, Ctx) ->
+    Tokens     = [T || {T, _} <- Events],
+    SentATok   = maps:get(sent_a_token, Ctx),
+    SuspectTok = maps:get(suspect_token, Ctx),
+    SentBTok   = maps:get(sent_b_token, Ctx),
+    SentA = lists:member(SentATok, Tokens),
+    Susp  = lists:member(SuspectTok, Tokens),
+    SentB = lists:member(SentBTok, Tokens),
+    Report = Ctx#{
+        events_received => length(Events),
+        tokens_received => Tokens,
+        sentinel_a_got  => SentA,
+        suspect_got     => Susp,
+        sentinel_b_got  => SentB
+    },
+    case {SentA, Susp, SentB} of
+        {true, true, true} ->
+            ok;
+        {true, false, true} ->
+            {error, {mpong_payload_silently_dropped, Report}};
+        {true, false, false} ->
+            {error, {publish_path_died_after_suspect, Report}};
+        {false, false, false} ->
+            {error, {wire_not_up_during_test, Report}};
+        _ ->
+            {error, {partial_delivery, Report}}
+    end.
 
 drain_sustained_pubsub_events(SubRef, Total, Floor, TimeoutMs) ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
