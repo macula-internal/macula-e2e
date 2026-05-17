@@ -53,7 +53,13 @@
     tombstone_propagation/1,
     cross_station_tombstone_propagation/1,
     subscribe_records_local/1,
-    subscribe_records_cross_station/1
+    subscribe_records_cross_station/1,
+    pubsub_mpong_shape/1,
+    cross_station_pubsub_mpong_shape/1,
+    pubsub_sustained_mpong/1,
+    cross_station_pubsub_sustained_mpong/1,
+    pubsub_io_macula_realm_simple/1,
+    pubsub_test_realm_mpong_payload/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -97,7 +103,23 @@ all() ->
      tombstone_propagation,
      cross_station_tombstone_propagation,
      subscribe_records_local,
-     subscribe_records_cross_station].
+     subscribe_records_cross_station,
+     %% Daemon-shape pubsub: io.macula realm + mpong-shape payload
+     %% (integer-keyed nested maps + negative ints) + sustained rate.
+     %% Each has a cross-station variant that exercises
+     %% daemon -> station -> station -> daemon.
+     pubsub_mpong_shape,
+     cross_station_pubsub_mpong_shape,
+     pubsub_sustained_mpong,
+     cross_station_pubsub_sustained_mpong,
+     %% Orthogonal-axis isolation: split realm key vs payload shape
+     %% so we know which one of "io.macula realm" or "mpong-shape
+     %% payload" is the failing variable. If io_macula_simple passes
+     %% and test_realm_mpong passes, neither axis alone is the
+     %% problem — interaction with topic prefix or realm membership
+     %% would be the next suspect.
+     pubsub_io_macula_realm_simple,
+     pubsub_test_realm_mpong_payload].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
@@ -391,6 +413,75 @@ subscribe_records_cross_station(Config) ->
             {error, _} = E -> E
         end
     end).
+
+%%--------------------------------------------------------------------
+%% Daemon-shape pubsub — single + cross station.
+%%
+%% Topic naming mirrors `hecate_topics:app_fact("mpong", "...", 1)':
+%% `<realm>/beam-campus/hecate/mpong/<name>_v1'. We reuse the
+%% production string verbatim under a `.e2e' suffix so the e2e run
+%% doesn't collide with live demo subscribers.
+%%--------------------------------------------------------------------
+
+pubsub_mpong_shape(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(weather_realm, Config),
+    Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                            "state_broadcast_v1.e2e">>),
+    expect_ok(macula_e2e_probe:pubsub_mpong_shape(Pub, Sub, Realm, Topic)).
+
+cross_station_pubsub_mpong_shape(Config) ->
+    cross_or_skip(Config, fun(Pub, Sub) ->
+        Realm = ?config(weather_realm, Config),
+        Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                                "state_broadcast_v1.e2e.cross">>),
+        macula_e2e_probe:cross_station_pubsub_mpong_shape(
+            Pub, Sub, Realm, Topic)
+    end).
+
+pubsub_sustained_mpong(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(weather_realm, Config),
+    Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                            "state_broadcast_v1.e2e.sustained">>),
+    expect_ok(macula_e2e_probe:pubsub_sustained_mpong(
+                Pub, Sub, Realm, Topic, 5, 10_000)).
+
+cross_station_pubsub_sustained_mpong(Config) ->
+    cross_or_skip(Config, fun(Pub, Sub) ->
+        Realm = ?config(weather_realm, Config),
+        Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                                "state_broadcast_v1.e2e.cross.sustained">>),
+        macula_e2e_probe:cross_station_pubsub_sustained_mpong(
+            Pub, Sub, Realm, Topic, 5, 10_000)
+    end).
+
+%%--------------------------------------------------------------------
+%% Axis-isolation probes.
+%%
+%% `pubsub_mpong_shape' combines two non-default variables vs the
+%% baseline `pubsub_roundtrip': realm = `io.macula' and payload =
+%% mpong shape (int-keyed nested maps + negative ints). These two
+%% tests vary one axis at a time so the failure surface can be
+%% pinned to the realm key, the payload shape, or the interaction
+%% of both with the long mpong-style topic prefix.
+%%--------------------------------------------------------------------
+
+pubsub_io_macula_realm_simple(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(weather_realm, Config),   %% io.macula
+    Topic = unique_topic(<<"e2e.io_macula.simple">>),
+    expect_ok(macula_e2e_probe:pubsub_roundtrip(Pub, Sub, Realm, Topic)).
+
+pubsub_test_realm_mpong_payload(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(test_realm, Config),      %% _test
+    Topic = unique_topic(<<"e2e.test_realm.mpong">>),
+    expect_ok(macula_e2e_probe:pubsub_mpong_shape(Pub, Sub, Realm, Topic)).
 
 cross_or_skip(Config, Fun) ->
     case ?config(cross, Config) of

@@ -53,7 +53,11 @@
     subscribe_records_cross_station/3,
     put_get_content/1,
     cross_station_put_content/2,
-    cross_station_dht_put_find/3
+    cross_station_dht_put_find/3,
+    pubsub_mpong_shape/4,
+    cross_station_pubsub_mpong_shape/4,
+    pubsub_sustained_mpong/6,
+    cross_station_pubsub_sustained_mpong/6
 ]).
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
@@ -905,6 +909,152 @@ pool_close_cleanup(Bootstrap) ->
         timeout ->
             macula:close(P),
             {error, pool_not_ready}
+    end.
+
+%%====================================================================
+%% Daemon-shape probes
+%%
+%% Mirror `hecate-daemon's mpong pubsub usage end-to-end:
+%%   - realm = `io.macula' (production realm)
+%%   - payload shape = integer-keyed nested maps with negative
+%%     integers in the velocity tuple — the wire shape that
+%%     crashed `macula_record_cbor:encode/1' pre-4.4.10 and
+%%     `macula_frame:wire_key/1' pre-4.4.10 (CHANGELOG 4.4.10)
+%%   - sustained rate (5Hz × 10s) instead of single-shot, matching
+%%     the `broadcast_game_state' tick stream
+%%
+%% Each scenario has a single-station and a cross-station variant.
+%% The cross-station variant exercises the
+%% daemon -> station -> station -> daemon path, which is what the
+%% production demo needs (publisher daemon on beam00 -> its primary
+%% relay -> realm's station_link on a different relay).
+%%====================================================================
+
+-define(SUSTAINED_RATE_HZ,         5).
+-define(SUSTAINED_DURATION_MS, 10_000).
+-define(SUSTAINED_FLOOR_PCT,      90).
+-define(SUSTAINED_DRAIN_GRACE_MS, 5_000).
+
+%% @doc Single mpong-shape roundtrip on the `io.macula' realm.
+%% Asserts the wire encode/decode survives integer map keys and
+%% negative integers under the production realm key.
+-spec pubsub_mpong_shape(PubPool :: macula:pool(),
+                         SubPool :: macula:pool(),
+                         macula:realm(),
+                         macula:topic()) -> result().
+pubsub_mpong_shape(PubPool, SubPool, Realm, Topic) ->
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Payload = mpong_state_payload(1),
+    ok = macula:publish(PubPool, Realm, Topic, Payload),
+    Result = await_event_match(SubRef, Topic, Payload, 5_000),
+    catch macula:unsubscribe(SubPool, SubRef),
+    Result.
+
+%% @doc Cross-station mpong-shape roundtrip — daemon -> station ->
+%% station -> daemon. Same payload shape as the single-station
+%% variant; PubPool and SubPool are dialled into distinct
+%% bootstrap seeds so the EVENT must traverse the relay mesh.
+-spec cross_station_pubsub_mpong_shape(PubPool :: macula:pool(),
+                                       SubPool :: macula:pool(),
+                                       macula:realm(),
+                                       macula:topic()) -> result().
+cross_station_pubsub_mpong_shape(PubPool, SubPool, Realm, Topic) ->
+    pubsub_mpong_shape(PubPool, SubPool, Realm, Topic).
+
+%% @doc Sustained-rate mpong-shape stream. Publishes `Rate' events
+%% per second for `DurationMs', then drains for an extra grace
+%% window. Asserts at least `?SUSTAINED_FLOOR_PCT' (% of total
+%% expected) unique events arrived. Floor is non-zero so the
+%% assertion catches "subscribe wired, zero delivery" silently.
+-spec pubsub_sustained_mpong(PubPool :: macula:pool(),
+                             SubPool :: macula:pool(),
+                             macula:realm(),
+                             macula:topic(),
+                             Rate :: pos_integer(),
+                             DurationMs :: pos_integer()) -> result().
+pubsub_sustained_mpong(PubPool, SubPool, Realm, Topic, Rate, DurationMs) ->
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Total      = max(1, (Rate * DurationMs) div 1_000),
+    IntervalMs = max(1, 1_000 div Rate),
+    Floor      = max(1, (Total * ?SUSTAINED_FLOOR_PCT) div 100),
+    Budget     = DurationMs + ?SUSTAINED_DRAIN_GRACE_MS,
+    Sender = spawn_link(fun() ->
+        run_sustained_sender(PubPool, Realm, Topic, Total, IntervalMs)
+    end),
+    Result = drain_sustained_pubsub_events(SubRef, Total, Floor, Budget),
+    exit(Sender, kill),
+    catch macula:unsubscribe(SubPool, SubRef),
+    Result.
+
+%% @doc Cross-station sustained-rate variant — daemon-shape source
+%% on one bootstrap, daemon-shape sink on a different bootstrap.
+%% Mirrors a production scenario where a host daemon on beam00
+%% broadcasts state and a subscriber daemon on macula.io (or the
+%% realm acting as a daemon-shaped subscriber) consumes the stream.
+-spec cross_station_pubsub_sustained_mpong(PubPool :: macula:pool(),
+                                           SubPool :: macula:pool(),
+                                           macula:realm(),
+                                           macula:topic(),
+                                           Rate :: pos_integer(),
+                                           DurationMs :: pos_integer()) ->
+        result().
+cross_station_pubsub_sustained_mpong(PubPool, SubPool, Realm, Topic,
+                                     Rate, DurationMs) ->
+    pubsub_sustained_mpong(PubPool, SubPool, Realm, Topic, Rate, DurationMs).
+
+%% Mpong-shape payload. The integer map keys (0, 1) in `score' /
+%% `paddles' and the negative integer in `vx' are the two CBOR
+%% wire-format extensions the daemon's broadcast path needs and
+%% that macula 4.4.10 added support for in the encode/decode path.
+%% `token' carries the tick so the assertion can dedupe in the
+%% sustained drain.
+mpong_state_payload(Tick) ->
+    #{
+        <<"token">>   => integer_to_binary(Tick),
+        <<"tick">>    => Tick,
+        <<"game_id">> => <<"e2e-mpong">>,
+        <<"score">>   => #{0 => Tick rem 11, 1 => (Tick * 7) rem 11},
+        <<"ball">>    => #{<<"x">>  => 500, <<"y">>  => 300,
+                           <<"vx">> =>  -3, <<"vy">> =>   2},
+        <<"paddles">> => #{0 => 498, 1 => 500}
+    }.
+
+run_sustained_sender(_Pool, _Realm, _Topic, 0, _IntervalMs) -> ok;
+run_sustained_sender(Pool, Realm, Topic, N, IntervalMs) ->
+    catch macula:publish(Pool, Realm, Topic, mpong_state_payload(N)),
+    timer:sleep(IntervalMs),
+    run_sustained_sender(Pool, Realm, Topic, N - 1, IntervalMs).
+
+drain_sustained_pubsub_events(SubRef, Total, Floor, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    Got      = drain_until_deadline(SubRef, sets:new(), Deadline),
+    Received = sets:size(Got),
+    case Received >= Floor of
+        true  -> ok;
+        false ->
+            {error, {sustained_below_floor,
+                     floor, Floor,
+                     received_unique, Received,
+                     total_published, Total}}
+    end.
+
+drain_until_deadline(SubRef, Acc, Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    drain_until_deadline_step(SubRef, Acc, Deadline, Remaining).
+
+drain_until_deadline_step(_SubRef, Acc, _Deadline, Remaining)
+  when Remaining =< 0 -> Acc;
+drain_until_deadline_step(SubRef, Acc, Deadline, Remaining) ->
+    receive
+        {macula_event, SubRef, _Topic, Payload, _Meta} ->
+            Token = extract_token(Payload),
+            drain_until_deadline(SubRef,
+                                 sets:add_element(Token, Acc),
+                                 Deadline)
+    after Remaining ->
+        Acc
     end.
 
 %%====================================================================
