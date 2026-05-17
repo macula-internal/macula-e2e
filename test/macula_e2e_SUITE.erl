@@ -141,6 +141,14 @@ all() ->
      cross_station_pubsub_mpong_diag].
 
 init_per_suite(Config) ->
+    {ok, _} = application:ensure_all_started(sasl),
+    %% Capture supervisor + gen_server crash reports through OTP's
+    %% default logger handler. Without this, a macula_station_link
+    %% gen_statem dying silently in the SDK's supervision tree
+    %% leaves no trace in the test log — which masked the mpong
+    %% publish-path-death root cause for a long time.
+    logger:set_handler_config(default, level, debug),
+    logger:set_application_level(macula, debug),
     {ok, _} = application:ensure_all_started(macula),
     Bootstrap = bootstrap_seeds(),
     BootstrapOther = bootstrap_seeds_other(),
