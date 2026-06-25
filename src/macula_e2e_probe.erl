@@ -61,7 +61,8 @@
     pubsub_payload_axis/5,
     cross_station_pubsub_payload_axis/5,
     pubsub_mpong_diag/4,
-    cross_station_pubsub_mpong_diag/4
+    cross_station_pubsub_mpong_diag/4,
+    pubsub_mpong_diag_spaced/4
 ]).
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
@@ -179,18 +180,8 @@ classify_unary_match(Got, Args) ->
                     macula:realm(),
                     macula:procedure()) -> result().
 streaming_rpc(ServerPool, CallerPool, Realm, Procedure) ->
-    Handler = fun(Stream, Args) ->
-        N = case Args of
-                #{<<"n">> := X} -> X;
-                #{n         := X} -> X
-            end,
-        lists:foreach(
-          fun(I) -> ok = macula:send(Stream, integer_to_binary(I)) end,
-          lists:seq(1, N)),
-        macula:close_stream(Stream)
-    end,
     ok = macula:advertise_stream(ServerPool, Realm, Procedure,
-                                  server_stream, Handler),
+                                  server_stream, fun stream_emit_handler/2),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Result =
         case macula:call_stream(CallerPool, Realm, Procedure,
@@ -202,6 +193,15 @@ streaming_rpc(ServerPool, CallerPool, Realm, Procedure) ->
         end,
     catch macula:unadvertise_stream(ServerPool, Realm, Procedure),
     Result.
+
+stream_emit_handler(Stream, Args) ->
+    N = stream_arg_n(Args),
+    lists:foreach(fun(I) -> ok = macula:send(Stream, integer_to_binary(I)) end,
+                  lists:seq(1, N)),
+    macula:close_stream(Stream).
+
+stream_arg_n(#{<<"n">> := X}) -> X;
+stream_arg_n(#{n := X}) -> X.
 
 classify_stream({ok, [<<"1">>, <<"2">>, <<"3">>]}) -> ok;
 classify_stream({ok, Got})                          -> {error, {unexpected_chunks, Got}};
@@ -390,19 +390,18 @@ drain_unique_pubsub_events(SubRef, Expected, Got, Deadline) ->
         {macula_event, SubRef, _Topic, Payload, _Meta} ->
             Token = extract_token(Payload),
             NewGot = sets:add_element(Token, Got),
-            case sets:size(NewGot) - sets:size(Got) of
-                1 -> drain_unique_pubsub_events(SubRef,
-                                                Expected - 1,
-                                                NewGot, Deadline);
-                0 -> drain_unique_pubsub_events(SubRef,
-                                                Expected,
-                                                NewGot, Deadline)
-            end
+            drain_pubsub_progress(sets:size(NewGot) - sets:size(Got),
+                                  SubRef, Expected, NewGot, Deadline)
     after Remaining ->
         {error, {missing_pubsub_events,
                  missing, Expected,
                  received_unique, sets:size(Got)}}
     end.
+
+drain_pubsub_progress(1, SubRef, Expected, NewGot, Deadline) ->
+    drain_unique_pubsub_events(SubRef, Expected - 1, NewGot, Deadline);
+drain_pubsub_progress(0, SubRef, Expected, NewGot, Deadline) ->
+    drain_unique_pubsub_events(SubRef, Expected, NewGot, Deadline).
 
 extract_token(Payload) ->
     case normalise_keys(Payload) of
@@ -493,32 +492,26 @@ classify_concurrent_call(I, Corr, Other, Errors) ->
                               macula:procedure()) -> result().
 many_concurrent_streams(NumStreams, ServerPool, CallerPool,
                         Realm, Procedure) ->
-    Handler = fun(Stream, Args) ->
-        N = case Args of
-                #{<<"n">> := X} -> X;
-                #{n         := X} -> X
-            end,
-        lists:foreach(
-          fun(I) -> ok = macula:send(Stream, integer_to_binary(I)) end,
-          lists:seq(1, N)),
-        macula:close_stream(Stream)
-    end,
     ok = macula:advertise_stream(ServerPool, Realm, Procedure,
-                                 server_stream, Handler),
+                                 server_stream, fun stream_emit_handler/2),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Parent = self(),
     Callers = [spawn_link(fun() ->
-        N = I + 2,    % each stream has a distinct length
-        Reply = case macula:call_stream(CallerPool, Realm, Procedure,
-                                        #{<<"n">> => N}, #{}) of
-                    {ok, Stream}     -> drain_stream(Stream, []);
-                    {error, _} = E   -> E
-                end,
-        Parent ! {stream_done, self(), I, N, Reply}
-    end) || I <- lists:seq(1, NumStreams)],
+                                  run_concurrent_caller(I, CallerPool, Realm,
+                                                        Procedure, Parent)
+                          end) || I <- lists:seq(1, NumStreams)],
     Result = gather_stream_results(Callers, NumStreams, []),
     catch macula:unadvertise_stream(ServerPool, Realm, Procedure),
     Result.
+
+run_concurrent_caller(I, CallerPool, Realm, Procedure, Parent) ->
+    N = I + 2,    % each stream has a distinct length
+    Reply = concurrent_caller_reply(
+              macula:call_stream(CallerPool, Realm, Procedure, #{<<"n">> => N}, #{})),
+    Parent ! {stream_done, self(), I, N, Reply}.
+
+concurrent_caller_reply({ok, Stream})   -> drain_stream(Stream, []);
+concurrent_caller_reply({error, _} = E) -> E.
 
 -spec cross_station_many_concurrent_streams(
         pos_integer(), macula:pool(), macula:pool(),
@@ -755,28 +748,39 @@ do_tombstone_propagation(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
     Record   = macula_record:node_record(NodeId, [Realm], 0),
     Signed   = macula_record:sign(Record, Identity),
     Key      = macula_record:storage_key(Signed),
-    case macula:put_record(WriterPool, Signed) of
-        ok ->
-            timer:sleep(?DHT_REPLICATION_MS),
-            case wait_until_visible(ReaderPool, Key, fun is_node_record/1, 10_000) of
-                ok ->
-                    Tombstone = macula_record:sign(
-                        macula_record:tombstone(NodeId,
-                            macula_record_type_node_record(),
-                            superseded), Identity),
-                    PutAt = erlang:monotonic_time(millisecond),
-                    case macula:put_record(WriterPool, Tombstone) of
-                        ok ->
-                            classify_tombstone_visible(
-                                wait_until_visible(ReaderPool, Key,
-                                                   fun is_tombstone/1, MaxWaitMs),
-                                erlang:monotonic_time(millisecond) - PutAt);
-                        {error, _} = E -> E
-                    end;
-                {error, _} = E -> {error, {original_not_visible, E}}
-            end;
-        {error, _} = E -> E
-    end.
+    tombstone_after_put(macula:put_record(WriterPool, Signed),
+                        WriterPool, ReaderPool, Realm, MaxWaitMs,
+                        Identity, NodeId, Key).
+
+tombstone_after_put(ok, WriterPool, ReaderPool, _Realm, MaxWaitMs,
+                    Identity, NodeId, Key) ->
+    timer:sleep(?DHT_REPLICATION_MS),
+    tombstone_after_visible(
+        wait_until_visible(ReaderPool, Key, fun is_node_record/1, 10_000),
+        WriterPool, ReaderPool, MaxWaitMs, Identity, NodeId, Key);
+tombstone_after_put({error, _} = E, _WriterPool, _ReaderPool, _Realm,
+                    _MaxWaitMs, _Identity, _NodeId, _Key) ->
+    E.
+
+tombstone_after_visible(ok, WriterPool, ReaderPool, MaxWaitMs,
+                        Identity, NodeId, Key) ->
+    Tombstone = macula_record:sign(
+        macula_record:tombstone(NodeId,
+            macula_record_type_node_record(),
+            superseded), Identity),
+    PutAt = erlang:monotonic_time(millisecond),
+    tombstone_after_reput(macula:put_record(WriterPool, Tombstone),
+                          ReaderPool, MaxWaitMs, Key, PutAt);
+tombstone_after_visible({error, _} = E, _WriterPool, _ReaderPool, _MaxWaitMs,
+                        _Identity, _NodeId, _Key) ->
+    {error, {original_not_visible, E}}.
+
+tombstone_after_reput(ok, ReaderPool, MaxWaitMs, Key, PutAt) ->
+    classify_tombstone_visible(
+        wait_until_visible(ReaderPool, Key, fun is_tombstone/1, MaxWaitMs),
+        erlang:monotonic_time(millisecond) - PutAt);
+tombstone_after_reput({error, _} = E, _ReaderPool, _MaxWaitMs, _Key, _PutAt) ->
+    E.
 
 classify_tombstone_visible(ok, LatencyMs) ->
     %% Returning the latency in `ok' tuple lets a future test assert
@@ -797,16 +801,17 @@ wait_until_visible(Pool, Key, Pred, MaxWaitMs) ->
     wait_until_visible_loop(Pool, Key, Pred, Deadline).
 
 wait_until_visible_loop(Pool, Key, Pred, Deadline) ->
-    case macula:find_record(Pool, Key) of
-        {ok, Rec} ->
-            case Pred(Rec) of
-                true  -> ok;
-                false ->
-                    sleep_or_timeout(Pool, Key, Pred, Deadline)
-            end;
-        _NotFoundOrError ->
-            sleep_or_timeout(Pool, Key, Pred, Deadline)
-    end.
+    wait_visible_found(macula:find_record(Pool, Key), Pool, Key, Pred, Deadline).
+
+wait_visible_found({ok, Rec}, Pool, Key, Pred, Deadline) ->
+    wait_visible_pred(Pred(Rec), Pool, Key, Pred, Deadline);
+wait_visible_found(_NotFoundOrError, Pool, Key, Pred, Deadline) ->
+    sleep_or_timeout(Pool, Key, Pred, Deadline).
+
+wait_visible_pred(true, _Pool, _Key, _Pred, _Deadline) ->
+    ok;
+wait_visible_pred(false, Pool, Key, Pred, Deadline) ->
+    sleep_or_timeout(Pool, Key, Pred, Deadline).
 
 sleep_or_timeout(Pool, Key, Pred, Deadline) ->
     case erlang:monotonic_time(millisecond) > Deadline of
@@ -848,27 +853,33 @@ do_subscribe_records(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
     Self = self(),
     Tag  = make_ref(),
     Callback = fun(Rec) -> Self ! {sub_record, Tag, Rec} end,
-    case macula:subscribe_records(ReaderPool,
-                                  macula_record_type_node_record(),
-                                  Callback) of
-        {ok, SubRef} ->
-            timer:sleep(?SUBSCRIBE_SETTLE_MS),
-            Identity = macula_identity:generate(),
-            NodeId   = macula_identity:public(Identity),
-            Record   = macula_record:node_record(NodeId, [Realm], 0),
-            Signed   = macula_record:sign(Record, Identity),
-            Key      = macula_record:storage_key(Signed),
-            PutAt    = erlang:monotonic_time(millisecond),
-            Result =
-                case macula:put_record(WriterPool, Signed) of
-                    ok ->
-                        await_record_callback(Tag, Key, PutAt, MaxWaitMs);
-                    {error, _} = E -> E
-                end,
-            catch macula:unsubscribe_records(ReaderPool, SubRef),
-            Result;
-        {error, _} = E -> {error, {subscribe_failed, E}}
-    end.
+    subscribe_records_subscribed(
+        macula:subscribe_records(ReaderPool,
+                                 macula_record_type_node_record(),
+                                 Callback),
+        WriterPool, ReaderPool, Realm, MaxWaitMs, Tag).
+
+subscribe_records_subscribed({ok, SubRef}, WriterPool, ReaderPool,
+                             Realm, MaxWaitMs, Tag) ->
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Identity = macula_identity:generate(),
+    NodeId   = macula_identity:public(Identity),
+    Record   = macula_record:node_record(NodeId, [Realm], 0),
+    Signed   = macula_record:sign(Record, Identity),
+    Key      = macula_record:storage_key(Signed),
+    PutAt    = erlang:monotonic_time(millisecond),
+    Result = subscribe_records_put(macula:put_record(WriterPool, Signed),
+                                   Tag, Key, PutAt, MaxWaitMs),
+    catch macula:unsubscribe_records(ReaderPool, SubRef),
+    Result;
+subscribe_records_subscribed({error, _} = E, _WriterPool, _ReaderPool,
+                             _Realm, _MaxWaitMs, _Tag) ->
+    {error, {subscribe_failed, E}}.
+
+subscribe_records_put(ok, Tag, Key, PutAt, MaxWaitMs) ->
+    await_record_callback(Tag, Key, PutAt, MaxWaitMs);
+subscribe_records_put({error, _} = E, _Tag, _Key, _PutAt, _MaxWaitMs) ->
+    E.
 
 await_record_callback(Tag, ExpectedKey, PutAt, TimeoutMs) ->
     receive
@@ -1111,6 +1122,45 @@ pubsub_mpong_diag(PubPool, SubPool, Realm, Topic) ->
 cross_station_pubsub_mpong_diag(PubPool, SubPool, Realm, Topic) ->
     pubsub_mpong_diag(PubPool, SubPool, Realm, Topic).
 
+%% Same shape as `pubsub_mpong_diag', but with a 500ms gap between
+%% each publish so the peering_conn's `drain_send_frames' batch-
+%% coalescing path (macula 4.7.0 perf optimisation) cannot collapse
+%% the three casts into a single multi-frame iolist + NIF call. If
+%% the suspect still drops with 500ms spacing, batching is NOT the
+%% cause — the payload's wire bytes themselves break delivery.
+-spec pubsub_mpong_diag_spaced(PubPool :: macula:pool(),
+                               SubPool :: macula:pool(),
+                               macula:realm(),
+                               macula:topic()) -> result().
+pubsub_mpong_diag_spaced(PubPool, SubPool, Realm, Topic) ->
+    PreStatusPub = macula:status(PubPool),
+    PreStatusSub = macula:status(SubPool),
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    SentinelA = sentinel_payload(<<"sentinel-a">>),
+    Suspect   = macula_e2e_mpong:state_payload(1),
+    SentinelB = sentinel_payload(<<"sentinel-b">>),
+    PubA = catch macula:publish(PubPool, Realm, Topic, SentinelA),
+    timer:sleep(500),
+    PubSuspect = catch macula:publish(PubPool, Realm, Topic, Suspect),
+    timer:sleep(500),
+    PubB = catch macula:publish(PubPool, Realm, Topic, SentinelB),
+    Window = collect_mpong_diag_events(SubRef, 8_000),
+    PostStatusPub = macula:status(PubPool),
+    catch macula:unsubscribe(SubPool, SubRef),
+    classify_mpong_diag(Window, #{
+        pre_pub_status      => PreStatusPub,
+        pre_sub_status      => PreStatusSub,
+        post_pub_status     => PostStatusPub,
+        publish_result_a    => PubA,
+        publish_result_susp => PubSuspect,
+        publish_result_b    => PubB,
+        spacing_ms          => 500,
+        sent_a_token        => maps:get(<<"token">>, SentinelA),
+        suspect_token       => maps:get(<<"token">>, Suspect),
+        sent_b_token        => maps:get(<<"token">>, SentinelB)
+    }).
+
 %% A sentinel is a simple binary-keyed map. `pubsub_roundtrip' uses
 %% the same shape and is known to deliver via the current fleet —
 %% so a missing sentinel is a hard signal that the wire is not up,
@@ -1128,18 +1178,17 @@ collect_mpong_diag_events(SubRef, TimeoutMs) ->
 
 collect_mpong_diag_events(SubRef, Deadline, Acc) ->
     Remaining = Deadline - erlang:monotonic_time(millisecond),
-    case Remaining =< 0 of
-        true -> lists:reverse(Acc);
-        false ->
-            receive
-                {macula_event, SubRef, _Topic, Payload, _Meta} ->
-                    Token = extract_token(Payload),
-                    collect_mpong_diag_events(
-                        SubRef, Deadline,
-                        [{Token, Payload} | Acc])
-            after Remaining ->
-                lists:reverse(Acc)
-            end
+    collect_mpong_diag_wait(Remaining =< 0, SubRef, Deadline, Remaining, Acc).
+
+collect_mpong_diag_wait(true, _SubRef, _Deadline, _Remaining, Acc) ->
+    lists:reverse(Acc);
+collect_mpong_diag_wait(false, SubRef, Deadline, Remaining, Acc) ->
+    receive
+        {macula_event, SubRef, _Topic, Payload, _Meta} ->
+            Token = extract_token(Payload),
+            collect_mpong_diag_events(SubRef, Deadline, [{Token, Payload} | Acc])
+    after Remaining ->
+        lists:reverse(Acc)
     end.
 
 classify_mpong_diag(Events, Ctx) ->
@@ -1224,14 +1273,15 @@ await_event_match(SubRef, Topic, ExpectedPayload, TimeoutMs) ->
     Expected1 = normalise_keys(ExpectedPayload),
     receive
         {macula_event, SubRef, Topic, Got, _Meta} ->
-            case normalise_keys(Got) =:= Expected1 of
-                true  -> ok;
-                false -> {error, {payload_mismatch, expected,
-                                  ExpectedPayload, got, Got}}
-            end
+            event_match_result(normalise_keys(Got) =:= Expected1, ExpectedPayload, Got)
     after TimeoutMs ->
         {error, {no_event, Topic, expected, ExpectedPayload}}
     end.
+
+event_match_result(true, _ExpectedPayload, _Got) ->
+    ok;
+event_match_result(false, ExpectedPayload, Got) ->
+    {error, {payload_mismatch, expected, ExpectedPayload, got, Got}}.
 
 %% Strip the SDK's CBOR atom/text-tuple key encoding so probe
 %% assertions can compare semantically. Accepts atom keys, plain

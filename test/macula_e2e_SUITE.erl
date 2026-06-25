@@ -66,7 +66,8 @@
     pubsub_axis_int_keys_neg_ints/1,
     pubsub_axis_atom_keys_neg_ints/1,
     pubsub_mpong_diag/1,
-    cross_station_pubsub_mpong_diag/1
+    cross_station_pubsub_mpong_diag/1,
+    pubsub_mpong_diag_spaced/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -138,7 +139,8 @@ all() ->
      %% "wire down" vs "payload silently dropped" vs "publish path
      %% died after suspect" failure modes.
      pubsub_mpong_diag,
-     cross_station_pubsub_mpong_diag].
+     cross_station_pubsub_mpong_diag,
+     pubsub_mpong_diag_spaced].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(sasl),
@@ -563,6 +565,20 @@ cross_station_pubsub_mpong_diag(Config) ->
                 {error, {mpong_diag_cross, Tag}}
         end
     end).
+
+pubsub_mpong_diag_spaced(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(weather_realm, Config),
+    Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
+                            "state_broadcast_v1.e2e.diag.spaced">>),
+    case macula_e2e_probe:pubsub_mpong_diag_spaced(Pub, Sub, Realm, Topic) of
+        ok ->
+            ok;
+        {error, {Tag, Report}} ->
+            ct:pal("[e2e][mpong-diag-spaced] ~p: ~p", [Tag, Report]),
+            ct:fail({mpong_diag_spaced, Tag})
+    end.
 
 cross_or_skip(Config, Fun) ->
     case ?config(cross, Config) of

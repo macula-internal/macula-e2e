@@ -100,15 +100,12 @@ docker_op(Host, Op, Container) ->
         "ssh -i ~/.ssh/id_hetzner -o BatchMode=yes -o ConnectTimeout=10 "
         "root@" ++ Host ++ " 'docker " ++ Op ++ " " ++ Container ++
         "' 2>/dev/null",
-    case os:cmd(Cmd) of
-        Out when is_list(Out) ->
-            %% docker pause / unpause / stop / start all echo the
-            %% container name on success and exit non-zero on
-            %% failure. We don't get the exit code via os:cmd, so
-            %% any echo that contains the container name as a
-            %% standalone token is treated as success.
-            case string:str(Out, Container) of
-                0 -> {error, {docker_op_failed, Op, Out}};
-                _ -> ok
-            end
-    end.
+    %% docker pause / unpause / stop / start all echo the container
+    %% name on success and exit non-zero on failure. We don't get the
+    %% exit code via os:cmd, so any echo that contains the container
+    %% name as a standalone token is treated as success.
+    Out = os:cmd(Cmd),
+    docker_op_result(string:str(Out, Container), Op, Out).
+
+docker_op_result(0, Op, Out) -> {error, {docker_op_failed, Op, Out}};
+docker_op_result(_, _Op, _Out) -> ok.
