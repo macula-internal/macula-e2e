@@ -65,6 +65,8 @@
     pubsub_axis_neg_ints_only/1,
     pubsub_axis_int_keys_neg_ints/1,
     pubsub_axis_atom_keys_neg_ints/1,
+    pubsub_axis_floats/1,
+    cross_station_pubsub_axis_floats/1,
     pubsub_mpong_diag/1,
     cross_station_pubsub_mpong_diag/1,
     pubsub_mpong_diag_spaced/1
@@ -135,6 +137,13 @@ all() ->
      pubsub_axis_neg_ints_only,
      pubsub_axis_int_keys_neg_ints,
      pubsub_axis_atom_keys_neg_ints,
+     %% Float axis: raw IEEE floats beside integer/string encodings of
+     %% the same numbers. Up to macula 5.2.2 the canonical encoder
+     %% rewrote a float as six-decimal text, so the leaf arrived with a
+     %% changed type and no error anywhere; from 7.0.0 it is carried as
+     %% binary64. A failure here names what actually arrived.
+     pubsub_axis_floats,
+     cross_station_pubsub_axis_floats,
      %% Deep-diag: sentinel + suspect + sentinel sandwich. Splits
      %% "wire down" vs "payload silently dropped" vs "publish path
      %% died after suspect" failure modes.
@@ -521,6 +530,18 @@ pubsub_axis_int_keys_only(Config) ->         run_axis(Config, int_keys_only).
 pubsub_axis_neg_ints_only(Config) ->         run_axis(Config, neg_ints_only).
 pubsub_axis_int_keys_neg_ints(Config) ->     run_axis(Config, int_keys_neg_ints).
 pubsub_axis_atom_keys_neg_ints(Config) ->    run_axis(Config, atom_keys_neg_ints).
+pubsub_axis_floats(Config) ->                run_axis(Config, floats).
+
+%% Same axis across a real station hop: publisher and subscriber sit on
+%% different stations, so the event is re-encoded for the second link
+%% rather than fanned out from the publisher's own station.
+cross_station_pubsub_axis_floats(Config) ->
+    cross_or_skip(Config, fun(Pub, Sub) ->
+        Realm = ?config(test_realm, Config),
+        Topic = unique_topic(<<"e2e.cross.axis.floats">>),
+        macula_e2e_probe:cross_station_pubsub_payload_axis(
+            floats, Pub, Sub, Realm, Topic)
+    end).
 
 run_axis(Config, Axis) ->
     Pub   = ?config(pool, Config),

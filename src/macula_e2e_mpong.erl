@@ -131,6 +131,11 @@ advertised_payload(GameId) ->
 %%                        a binary-keyed nested map, no int keys.
 %%   `int_keys_neg_ints'— int keys AND negative ints, no atom keys.
 %%   `atom_keys_neg_ints' — atom keys AND negative ints, no int keys.
+%%   `floats'           — raw IEEE floats (positive and negative) beside
+%%                        integer and string encodings of the same
+%%                        numbers, so a run reports whether the float
+%%                        leaf survives and simultaneously proves the
+%%                        wire was alive.
 %%   `full'             — same as `state_payload(Tick)'.
 -spec axis_payload(atom(), non_neg_integer()) -> map().
 axis_payload(atom_keys_only, Tick) ->
@@ -169,6 +174,28 @@ axis_payload(atom_keys_neg_ints, Tick) ->
         tick    => Tick,
         ball    => #{vx => -3, vy => 2},
         <<"token">> => integer_to_binary(Tick)
+    };
+%% Magnitudes here are deliberately small. Up to macula 5.2.2 the
+%% canonical encoder rewrote a float as `float_to_binary(F,
+%% [{decimals,6}, compact])', which RAISES badarg past ~1.0e15 — and it
+%% raised inside the shared peering connection, killing the link and
+%% every frame queued behind it. A live-fleet probe must measure the
+%% rewrite, not induce an outage; the large-magnitude crash vector
+%% belongs in macula's own unit tests, which cover it.
+axis_payload(floats, Tick) ->
+    #{
+        <<"token">>   => integer_to_binary(Tick),
+        <<"kind">>    => <<"floats">>,
+        <<"tick">>    => Tick,
+        %% Raw floats: the leaves under test. Negative included because
+        %% a self-asserted western longitude is the real fleet case.
+        <<"lat">>     => 50.8069,
+        <<"lng">>     => -3.7038,
+        %% Controls, both already known to survive: if these arrive and
+        %% the floats do not, the payload crossed the wire intact and
+        %% the float leaf alone was rewritten.
+        <<"lat_e6">>  => 50806900,
+        <<"lat_str">> => <<"50.8069">>
     };
 axis_payload(full, Tick) ->
     state_payload(Tick).
