@@ -662,9 +662,30 @@ wait_for_healthy([Pool | Rest] = All, Remaining) ->
             wait_for_healthy(All, Remaining - 500)
     end.
 
+%% Bounded, deliberately. This used to append a raw
+%% `erlang:unique_integer([positive])', so every run minted a brand-new topic at
+%% each of 26 call sites. That is unbounded namespace growth, and it does not
+%% stay in the test: a subscribed topic enters the station's local Bloom, is
+%% absorbed into the mesh-wide MERGED union, and never clears, because
+%% `macula_station_bloom_exchange:do_rebuild/1' merges peers' already-merged
+%% filters so a bit set once survives via the peer. The filter is 8192 bits /
+%% 7 hashes, where false positives reach ~5% at roughly 1300 topics and a Bloom
+%% hit stops being better than flooding. 26 fresh topics per run reaches that in
+%% about two days of hourly runs; the only reason it has not is that station
+%% restarts reset the union.
+%%
+%% It is also a straight violation of the project's own topic rule: "NEVER use
+%% ID-specific topics ... ALWAYS put IDs in payloads."
+%%
+%% 8 slots keeps adjacent runs from colliding while capping this suite's
+%% permanent contribution at 26 x 8 = 208 topics rather than unbounded. The
+%% fully rule-compliant form is one fixed topic per probe with the run id in the
+%% payload; that is a larger change to isolation semantics than this fix.
+-define(TOPIC_SLOTS, 8).
+
 unique_topic(Prefix) ->
-    Suffix = integer_to_binary(erlang:unique_integer([positive])),
-    <<Prefix/binary, ".", Suffix/binary>>.
+    Slot = erlang:unique_integer([positive]) rem ?TOPIC_SLOTS,
+    <<Prefix/binary, ".", (integer_to_binary(Slot))/binary>>.
 
 expect_ok(ok) ->
     ok;
