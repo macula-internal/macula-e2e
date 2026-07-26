@@ -60,6 +60,7 @@
     cross_station_pubsub_sustained_mpong/6,
     pubsub_payload_axis/5,
     cross_station_pubsub_payload_axis/5,
+    publish_refuses_colliding_keys/4,
     pubsub_mpong_diag/4,
     cross_station_pubsub_mpong_diag/4,
     pubsub_mpong_diag_spaced/4
@@ -1059,6 +1060,40 @@ pubsub_payload_axis(Axis, PubPool, SubPool, Realm, Topic) ->
                                         macula:topic()) -> result().
 cross_station_pubsub_payload_axis(Axis, PubPool, SubPool, Realm, Topic) ->
     pubsub_payload_axis(Axis, PubPool, SubPool, Realm, Topic).
+
+%% @doc A payload whose keys COLLIDE on the wire must be refused at
+%% publish, loudly, and must not reach a subscriber.
+%%
+%% `#{game_id => X, <<"game_id">> => X}' is one key on the wire, so before
+%% macula 6.0.0 it shipped two keys and delivered one while `publish'
+%% returned `ok'. That silent `ok' is the whole reason this probe exists,
+%% and the assertion is two-sided on purpose: the error alone would still
+%% pass if the frame ALSO went out, and delivery-absence alone cannot tell
+%% a refusal from a dropped event.
+-spec publish_refuses_colliding_keys(PubPool :: macula:pool(),
+                                     SubPool :: macula:pool(),
+                                     macula:realm(),
+                                     macula:topic()) -> result().
+publish_refuses_colliding_keys(PubPool, SubPool, Realm, Topic) ->
+    {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Payload = macula_e2e_mpong:colliding_key_payload(<<"e2e-collide">>),
+    Published = catch macula:publish(PubPool, Realm, Topic, Payload),
+    Result = classify_collision(Published, SubRef, Topic, Payload),
+    catch macula:unsubscribe(SubPool, SubRef),
+    Result.
+
+classify_collision({error, {unsupported_payload_type, duplicate_wire_key, _}},
+                   SubRef, Topic, _Payload) ->
+    %% Refused at publish. Now prove nothing went out anyway.
+    refusal_was_silent(await_any_event(SubRef, 2_000), Topic);
+classify_collision(ok, _SubRef, _Topic, Payload) ->
+    {error, {colliding_keys_accepted, Payload}};
+classify_collision(Other, _SubRef, _Topic, _Payload) ->
+    {error, {unexpected_publish_result, Other}}.
+
+refusal_was_silent(ok, Topic)          -> {error, {refused_but_delivered, Topic}};
+refusal_was_silent({error, _}, _Topic) -> ok.
 
 %%====================================================================
 %% Deep-diagnose probe — sentinel + suspect + sentinel

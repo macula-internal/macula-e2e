@@ -29,6 +29,7 @@
 -export([
     state_payload/1, state_payload/2,
     advertised_payload/1,
+    colliding_key_payload/1,
     axis_payload/2,
     state_topic/0, advertise_topic/0,
     realm/0
@@ -92,13 +93,29 @@ state_payload(Tick, GameId) ->
         tick      => Tick,
         arena     => #{w => 1000, h => 1000}
     },
-    %% Match `broadcast_game_state:broadcast/2': it adds a separate
-    %% binary-keyed `<<"game_id">>' over the atom-keyed StateMsg, so
-    %% the wire map carries BOTH keys. Plus the harness `token' so
-    %% the drain can dedupe by tick.
-    StateMsg#{
+    %% Matches `broadcast_game_state:payload/2' — ONE game_id key, the
+    %% atom one, already in StateMsg above.
+    %%
+    %% This fixture used to add a binary-keyed `<<"game_id">>' on top,
+    %% faithfully reproducing a daemon that did the same. Both are one key
+    %% on the wire, so the payload shipped two and delivered one. macula
+    %% 6.0.0+ rejects it outright, which is what surfaced the daemon bug;
+    %% the daemon now sends a single atom key and so does this.
+    %%
+    %% `<<"token">>' is harness-only (the drain dedupes by tick) and does
+    %% NOT collide: StateMsg has no atom `token'.
+    StateMsg#{<<"token">> => integer_to_binary(Tick)}.
+
+%% @doc The payload shape mpong published BEFORE the duplicate-key fix:
+%% `game_id' as both an atom and a binary key. Kept so a probe can assert
+%% the SDK still refuses it. Deleting it would leave nothing pinning the
+%% behaviour that caught the bug.
+-spec colliding_key_payload(binary()) -> map().
+colliding_key_payload(GameId) ->
+    #{
+        game_id       => GameId,
         <<"game_id">> => GameId,
-        <<"token">>   => integer_to_binary(Tick)
+        tick          => 1
     }.
 
 %% @doc game_advertised_v1 payload. Matches `advertise_game:announce/1'
@@ -138,13 +155,17 @@ advertised_payload(GameId) ->
 %%                        wire was alive.
 %%   `full'             — same as `state_payload(Tick)'.
 -spec axis_payload(atom(), non_neg_integer()) -> map().
+%% The token is an ATOM key here, not `<<"token">>'. An atom key and a
+%% binary key of the same name are ONE key on the wire, so carrying both
+%% made this axis a colliding-key payload — it tested collision handling
+%% while claiming to test atom keys, and macula 6.0.0+ rejects it at
+%% publish. `extract_token/1' normalises keys, so an atom token matches.
 axis_payload(atom_keys_only, Tick) ->
     #{
-        token   => Tick,
+        token   => integer_to_binary(Tick),
         kind    => atom_keys_only,
         tick    => Tick,
-        nested  => #{alpha => 1, beta => 2, gamma => 3},
-        <<"token">> => integer_to_binary(Tick)
+        nested  => #{alpha => 1, beta => 2, gamma => 3}
     };
 axis_payload(int_keys_only, Tick) ->
     #{
@@ -167,13 +188,13 @@ axis_payload(int_keys_neg_ints, Tick) ->
         <<"tick">>  => Tick,
         <<"score">> => #{0 => -1, 1 => 2}
     };
+%% Atom token for the same reason as `atom_keys_only' above.
 axis_payload(atom_keys_neg_ints, Tick) ->
     #{
-        token   => Tick,
+        token   => integer_to_binary(Tick),
         kind    => atom_keys_neg_ints,
         tick    => Tick,
-        ball    => #{vx => -3, vy => 2},
-        <<"token">> => integer_to_binary(Tick)
+        ball    => #{vx => -3, vy => 2}
     };
 %% Magnitudes here are deliberately small. Up to macula 5.2.2 the
 %% canonical encoder rewrote a float as `float_to_binary(F,

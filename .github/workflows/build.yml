@@ -6,8 +6,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Elvis was configured in rebar.config but nothing ever ran it, so the
+  # rules were advisory: a nesting violation reached main without comment.
+  # The probes here are the instrument the fleet is judged by, so they get
+  # linted like library code.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          rebar3-version: '3.24'
+
+      - name: Elvis
+        run: rebar3 as lint lint
+
   image:
     runs-on: ubuntu-latest
+    needs: lint
     permissions:
       contents: read
       packages: write

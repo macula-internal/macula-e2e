@@ -67,6 +67,7 @@
     pubsub_axis_atom_keys_neg_ints/1,
     pubsub_axis_floats/1,
     cross_station_pubsub_axis_floats/1,
+    publish_refuses_colliding_keys/1,
     pubsub_mpong_diag/1,
     cross_station_pubsub_mpong_diag/1,
     pubsub_mpong_diag_spaced/1
@@ -144,6 +145,10 @@ all() ->
      %% binary64. A failure here names what actually arrived.
      pubsub_axis_floats,
      cross_station_pubsub_axis_floats,
+     %% The payload shape mpong used to publish: game_id as both an atom
+     %% and a binary key, which is ONE key on the wire. Asserts the SDK
+     %% refuses it at publish AND that nothing reaches the subscriber.
+     publish_refuses_colliding_keys,
      %% Deep-diag: sentinel + suspect + sentinel sandwich. Splits
      %% "wire down" vs "payload silently dropped" vs "publish path
      %% died after suspect" failure modes.
@@ -542,6 +547,14 @@ cross_station_pubsub_axis_floats(Config) ->
         macula_e2e_probe:cross_station_pubsub_payload_axis(
             floats, Pub, Sub, Realm, Topic)
     end).
+
+publish_refuses_colliding_keys(Config) ->
+    Pub   = ?config(pool, Config),
+    Sub   = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Topic = unique_topic(<<"e2e.colliding_keys">>),
+    expect_ok(macula_e2e_probe:publish_refuses_colliding_keys(
+                Pub, Sub, Realm, Topic)).
 
 run_axis(Config, Axis) ->
     Pub   = ?config(pool, Config),
