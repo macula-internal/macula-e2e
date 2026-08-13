@@ -138,22 +138,40 @@ that nothing but a human dialling it from outside could tell.**
 by a script instead of a session: conns held with zero outbound, or an empty
 verified-peer set, while the station reports healthy.
 
-### 2.2 Still half-joined — the leaf defect is separate and survives
+### 2.2 The record layer needed time, not a fix
 
-Reachability came back; the record layer did not.
+Six minutes after the restart milan held 1 record and 1 routing entry — itself.
+I read that as FLEET.md's documented "leaves are only HALF joined" defect
+surviving the reboot. **That reading was premature and wrong.** Twenty minutes
+in:
 
-| | records held | routing entries |
+| | 6 min after restart | 20 min after restart |
 |---|---|---|
-| station-it-milan (6 min after restart) | **1** (its own) | **1** (itself) |
-| station-se-stockholm (up 2 weeks) | 16 | 4 |
+| station-it-milan | records 1, routing 1 | **records 15, routing 5** |
+| station-se-stockholm (up 2 weeks) | records 16, routing 4 | records 16, routing 4 |
 
-Milan holds seven connections and one verified peer, and still knows only
-itself. That is FLEET.md's documented "leaves are only HALF joined" defect, and
-it is **not** what the reboot fixed — it is a second, independent problem that a
-restart does not touch. Being reachable and being joined are different states,
-which is exactly why `station-joined.sh` checks both.
+Milan converged on its own to the same shape as the healthy leaf. Nothing was
+done to it between the two readings.
 
-Re-checked after two replicate ticks; see §2.3.
+Two things follow.
+
+**The reboot fixed everything.** There is no second defect. Reachability and
+membership both came back; membership just took roughly four replicate ticks,
+which is what a station rejoining a mesh from cold should look like.
+
+**FLEET.md's leaf claim is stale.** It states that both leaves report
+`dht.size = 1` and "cannot see the mesh", and instructs the reader to treat any
+leaf-originated measurement as unreliable. Neither leaf is in that state:
+stockholm read 16 records at every sample today, and milan reads 15. That note
+was describing milan's wedged transport — the §2 defect seen from the record
+layer — and it outlived its cause. Worth correcting there, because it currently
+tells an operator to discard good data from two stations.
+
+**Method note for the next session:** a station that has just restarted has not
+finished joining, and the difference between "not joined" and "not joined YET"
+is a replicate tick. `station-joined.sh` answers reachability immediately and
+membership only after convergence, so read it twice, minutes apart, before
+concluding anything about a fresh station.
 
 ---
 
