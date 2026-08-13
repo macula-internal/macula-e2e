@@ -542,6 +542,52 @@ verified RED before its green was believed.
 
 ---
 
+## 9.5 Fault injection now has a caller, and a first result
+
+`macula_e2e_fault.erl` was complete docker-level fault injection that nothing
+called — item 4 on the open list. It has a caller now: two rounds in
+`macula_e2e_duel`, run through `scripts/duel-fault.sh`, deliberately separate
+from the routine 23 so a normal duel never disrupts the fleet.
+
+- **`service_survives_station_pause`** — a `docker pause' freezes the station's
+  BEAM without severing sockets. A service on it keeps delivery across the
+  transient stall. **PASS.**
+- **`service_survives_station_restart`** — the station is STOPPED (its BEAM
+  dies, the subscription is lost on the far side) and STARTED. The pool redials,
+  re-handshakes, and the subscription is replayed
+  (`macula_client_replay:subs_to`). **PASS**, once the window was right.
+
+Run against `station-se-stockholm`, the degree-1 leaf, chosen for minimal blast
+radius — nothing routes through it. The station is restored three ways: an
+Erlang `after', the script's EXIT trap, and a re-check; verified healthy after
+every run.
+
+### The finding is about recovery time, and it corrected a false-RED of my own
+
+The first run reported `subscription_not_replayed_after_restart`. That was the
+test, not the mesh. My recovery window was ~34s; widening it to ~90s turned it
+green. So **the subscription is replayed and delivery does resume** — it takes
+about a minute on a leaf, dominated by the ~30s bloom-exchange cadence the
+upstream needs to re-learn the replayed subscription, not by the client replay,
+which is fast.
+
+A too-short window manufactured a "replay is broken" finding that a correct
+window disproves — the exact failure mode this whole session has been about,
+committed by me, caught before it was reported as a defect.
+
+### A regression this uncovered, now fixed
+
+The fault and diagnostics modules both ssh'ed a station by its tuple's Host
+field with a hardcoded `id_hetzner'. The 2026-08 fleet rewrite made that Host
+field the DIAL name (`station-fi-helsinki.macula.io'), which is not in
+known_hosts and whose box takes a different key on the four non-Hetzner boxes.
+So both modules failed host-key verification on every station — and, being
+failure-path or unused code, nobody had noticed. `macula_e2e_fleet:ssh_target/1'
+now models the box reach separately from the dial identity; 6 eunit tests pin
+it, verified RED against the old hardcoded key.
+
+---
+
 ## 10. Open, ranked
 
 1. **hex has frozen macula's registry at 8.0.0.** 8.0.1 and 8.0.2 are both
@@ -553,8 +599,10 @@ verified RED before its green was believed.
 3. **Resolve the per-publisher ordering bullet** in `PUBSUB_GUIDE.md`: does it
    promise delivery order or only a monotonic `seq`? Seven runs, four pairs, no
    clean run.
-4. **`macula_e2e_fault.erl` still has zero callers.** Link loss and replay have
-   no coverage and the fleet auto-rolls daily.
+4. ✅ **DONE — `macula_e2e_fault.erl` has a caller** (§9.5). Pause and restart
+   survival both pass against the leaf; recovery on a leaf is ~1 min. The
+   remaining coverage gap is a CLEAN measurement of replay latency on a
+   directly-connected core pair, which is a blast-radius decision.
 5. **SWIM on both leaves**, stuck at 1 since 2026-07-27.
 6. **Frankfurt's 12,392 inbound peering workers**, all alive, against
    stockholm's 10. Undiagnosed.
