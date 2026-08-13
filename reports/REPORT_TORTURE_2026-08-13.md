@@ -114,6 +114,47 @@ Milan is a degree-1 leaf that FLEET.md already flags as half-joined, so it is
 **excluded from the torture pair** — a leaf cannot carry a cross-station
 measurement. Recorded as a fleet defect, not a blocker.
 
+### 2.1 The reboot confirmed the diagnosis
+
+Raf rebooted the box. Before and after, via `scripts/station-joined.sh`:
+
+| | before | after reboot |
+|---|---|---|
+| reachable from outside | **no** (20 s timeout) | **yes**, 251 ms |
+| conns | 54 | 7 |
+| **with outbound** | **0** | **1** (paris, as designed) |
+| **verified hostnames** | **[]** | **1** |
+| listener connected | 54 | 6 |
+
+The whole fleet is now green, and milan answers with node id `af7b6b1ad72b1120`
+— matching FLEET.md, so the identity survived and the data volume is intact.
+
+This is the diagnosis confirmed rather than merely consistent: the transport was
+wedged, the 54 conns were phantom, and a restart clears it. The station itself
+never noticed and never would have. **The defect is not that milan broke — it is
+that nothing but a human dialling it from outside could tell.**
+
+`scripts/station-joined.sh` now encodes the signature so the next one is caught
+by a script instead of a session: conns held with zero outbound, or an empty
+verified-peer set, while the station reports healthy.
+
+### 2.2 Still half-joined — the leaf defect is separate and survives
+
+Reachability came back; the record layer did not.
+
+| | records held | routing entries |
+|---|---|---|
+| station-it-milan (6 min after restart) | **1** (its own) | **1** (itself) |
+| station-se-stockholm (up 2 weeks) | 16 | 4 |
+
+Milan holds seven connections and one verified peer, and still knows only
+itself. That is FLEET.md's documented "leaves are only HALF joined" defect, and
+it is **not** what the reboot fixed — it is a second, independent problem that a
+restart does not touch. Being reachable and being joined are different states,
+which is exactly why `station-joined.sh` checks both.
+
+Re-checked after two replicate ticks; see §2.3.
+
 ---
 
 ## 3. Stale topology in the harness — CORRECTED
