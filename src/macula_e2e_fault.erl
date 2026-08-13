@@ -42,13 +42,13 @@
 %% `unpause_station/1' is instantaneous.
 -spec pause_station(nick()) -> ok | {error, term()}.
 pause_station(Nick) ->
-    {Host, Container} = host_container(Nick),
-    docker_op(Host, "pause", Container).
+    {SshHost, SshKey, Container} = host_container(Nick),
+    docker_op(SshHost, SshKey, "pause", Container).
 
 -spec unpause_station(nick()) -> ok | {error, term()}.
 unpause_station(Nick) ->
-    {Host, Container} = host_container(Nick),
-    docker_op(Host, "unpause", Container).
+    {SshHost, SshKey, Container} = host_container(Nick),
+    docker_op(SshHost, SshKey, "unpause", Container).
 
 %% @doc Stop the named station with a 1s grace window. The BEAM
 %% receives SIGTERM, gets a moment to flush, then SIGKILL.
@@ -56,13 +56,13 @@ unpause_station(Nick) ->
 %% up with persistent state intact.
 -spec stop_station(nick()) -> ok | {error, term()}.
 stop_station(Nick) ->
-    {Host, Container} = host_container(Nick),
-    docker_op(Host, "stop -t 1", Container).
+    {SshHost, SshKey, Container} = host_container(Nick),
+    docker_op(SshHost, SshKey, "stop -t 1", Container).
 
 -spec start_station(nick()) -> ok | {error, term()}.
 start_station(Nick) ->
-    {Host, Container} = host_container(Nick),
-    docker_op(Host, "start", Container).
+    {SshHost, SshKey, Container} = host_container(Nick),
+    docker_op(SshHost, SshKey, "start", Container).
 
 %% @doc Run `Fun' while the named station is paused. Restoration is
 %% registered with `try ... after' so the station always returns to
@@ -91,15 +91,24 @@ with_stopped(Nick, Fun) ->
 
 host_container(Nick) ->
     case lists:keyfind(Nick, 3, macula_e2e_fleet:stations()) of
-        {Host, Container, Nick} -> {Host, Container};
-        false -> error({unknown_station, Nick})
+        {_DialHost, Container, Nick} ->
+            {SshHost, SshKey} = macula_e2e_fleet:ssh_target(Nick),
+            {SshHost, SshKey, Container};
+        false ->
+            error({unknown_station, Nick})
     end.
 
-docker_op(Host, Op, Container) ->
+%% Resolve the ssh reach through `macula_e2e_fleet:ssh_target/1' rather
+%% than off the station tuple's dial host + a hardcoded `id_hetzner'.
+%% As hardcoded, this reached only the three Hetzner boxes and silently
+%% failed host-key verification on the four others — so a fault probe
+%% aimed at a Linode leaf, the LOWEST-blast-radius target, was exactly
+%% the one that could not run.
+docker_op(SshHost, SshKey, Op, Container) ->
     Cmd =
-        "ssh -i ~/.ssh/id_hetzner -o BatchMode=yes -o ConnectTimeout=10 "
-        "root@" ++ Host ++ " 'docker " ++ Op ++ " " ++ Container ++
-        "' 2>/dev/null",
+        "ssh -i ~/.ssh/" ++ SshKey ++ " -o BatchMode=yes "
+        "-o ConnectTimeout=10 root@" ++ SshHost ++ " 'docker " ++ Op ++
+        " " ++ Container ++ "' 2>/dev/null",
     %% docker pause / unpause / stop / start all echo the container
     %% name on success and exit non-zero on failure. We don't get the
     %% exit code via os:cmd, so any echo that contains the container

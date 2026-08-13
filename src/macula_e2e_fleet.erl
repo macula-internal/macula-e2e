@@ -37,13 +37,24 @@
 -module(macula_e2e_fleet).
 
 -export([stations/0, names/0, domain/0, port/0,
-         seed_url/1, core/0, leaves/0, two_hop_pair/0]).
+         seed_url/1, core/0, leaves/0, two_hop_pair/0,
+         ssh_target/1]).
 
--export_type([station/0]).
+-export_type([station/0, ssh_target/0]).
 
 -type station() :: {Host :: string(),
                     Container :: string(),
                     NickName :: string()}.
+
+%% Where a station's BOX lives for ssh, as distinct from where the
+%% station DIALS. The two are not the same thing and conflating them is
+%% a real trap: `station-fi-helsinki.macula.io' resolves and is the
+%% dial identity, but it is not in known_hosts and its box is reached as
+%% `relays-hetzner-helsinki.macula.io' with a specific key. The three
+%% Hetzner boxes take `id_hetzner', frankfurt (the realm host) takes
+%% `id_rsa', and the Linode boxes take `id_ed25519'. `station/0''s Host
+%% field is the dial name; this is the ssh name.
+-type ssh_target() :: {SshHost :: string(), SshKey :: string()}.
 
 -define(DOMAIN, ".macula.io").
 -define(PORT,   4433).
@@ -79,6 +90,33 @@ port() -> ?PORT.
 seed_url(Station) ->
     iolist_to_binary([<<"https://">>, Station, ?DOMAIN, <<":">>,
                       integer_to_binary(?PORT)]).
+
+%% @doc The ssh reach for a station's box: `{SshHost, SshKey}'.
+%%
+%% This is deliberately NOT derived from the station tuple's Host field.
+%% That field is the DIAL identity (`station-fi-helsinki.macula.io'),
+%% which resolves for QUIC but is not the box's ssh name and is not in
+%% known_hosts. Anything that ssh'es a station — diagnostics capture,
+%% fault injection — must resolve through here, or it fails
+%% host-key verification on every box and picks the wrong key on the
+%% four non-Hetzner ones.
+-spec ssh_target(string()) -> ssh_target().
+ssh_target("station-de-falkenstein") ->
+    {"stations-hetzner-falkenstein.macula.io", "id_hetzner"};
+ssh_target("station-fi-helsinki") ->
+    {"relays-hetzner-helsinki.macula.io", "id_hetzner"};
+ssh_target("station-de-nuremberg") ->
+    {"relays-hetzner-nuremberg.macula.io", "id_hetzner"};
+ssh_target("station-fr-paris") ->
+    {"relays-linode-paris.macula.io", "id_ed25519"};
+ssh_target("station-de-frankfurt") ->
+    {"macula.io", "id_rsa"};
+ssh_target("station-it-milan") ->
+    {"172.232.219.239", "id_ed25519"};
+ssh_target("station-se-stockholm") ->
+    {"172.234.124.60", "id_ed25519"};
+ssh_target(Other) ->
+    error({no_ssh_target, Other}).
 
 %% @doc The five core stations. Each dials three of the other four.
 -spec core() -> [string()].

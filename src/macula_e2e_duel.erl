@@ -46,7 +46,8 @@
 %%%-------------------------------------------------------------------
 -module(macula_e2e_duel).
 
--export([main/0, pair/0, run/2, run/3, rounds/0, round_names/0, format/1]).
+-export([main/0, main_fault/0, pair/0, run/2, run/3, rounds/0,
+         fault_rounds/0, round_names/0, format/1]).
 
 %% Individual rounds, exported so a CT suite can name one per test case.
 -export([distinct_stations/2,
@@ -69,7 +70,9 @@
          content_put_get_cross/2,
          content_size_axis/2,
          torture_concurrent_calls/2,
-         torture_sustained_pubsub/2]).
+         torture_sustained_pubsub/2,
+         service_survives_station_pause/2,
+         service_survives_station_restart/2]).
 
 -define(SETTLE_MS,          3_000).
 -define(EVENT_WAIT_MS,      8_000).
@@ -84,6 +87,15 @@
 -define(CONTENT_SIZES, [1024, 65536, 262144, 262145, 1048576]).
 -define(CONTENT_FETCH_ATTEMPTS, 4).
 -define(CONTENT_RETRY_MS,   3_000).
+
+%% Fault rounds. A stopped station's BEAM cold-boots (~20-30s measured on
+%% milan) and the client pool then redials on its own backoff (up to
+%% ?MAX_BACKOFF 60s), so recovery can take well over a minute. Poll,
+%% don't sleep-once.
+-define(FAULT_DOWN_WAIT_MS, 60_000).
+-define(FAULT_UP_WAIT_MS,  180_000).
+-define(FAULT_POLL_MS,       2_000).
+-define(FAULT_REPLAY_MS,    10_000).
 
 -type result()  :: ok | {error, term()}.
 -type report()  :: [{atom(), result()}].
@@ -107,25 +119,55 @@ main() ->
     io:format("~s", [format(Report)]),
     halt(exit_code(Report)).
 
-with_services(StationA, StationB, RunId) ->
-    on_service_a(macula_e2e_service:start(<<"a">>, StationA, RunId),
-                 StationB, RunId).
+%% @doc Stand two services up and run ONLY the fault rounds, which
+%% deliberately restart a live station. Kept separate from `main/0'
+%% because a routine duel must never disrupt the fleet, and because the
+%% blast radius is a deliberate choice: this defaults service A onto a
+%% degree-1 LEAF (stockholm), whose restart affects nothing that routes
+%% through it, and pins B to that leaf's one upstream.
+-spec main_fault() -> no_return().
+main_fault() ->
+    {ok, _} = application:ensure_all_started(macula),
+    {StationA, StationB} = fault_pair(),
+    RunId = run_id(),
+    io:format("~n=== duel FAULT ~s ===~n  a (RESTARTED): ~s~n  b: ~s~n~n",
+              [RunId, StationA, StationB]),
+    Report = with_services_run(StationA, StationB, RunId, fault_rounds()),
+    io:format("~s", [format(Report)]),
+    halt(exit_code(Report)).
 
-on_service_a({error, Reason}, _StationB, _RunId) ->
+%% Leaf first, so the station this run stops and starts is the one with
+%% no inbound edges. Override with MACULA_E2E_DUEL_PAIR like the others.
+fault_pair() ->
+    parse_pair_default(os:getenv("MACULA_E2E_DUEL_PAIR"),
+                       {"station-se-stockholm", "station-fi-helsinki"}).
+
+parse_pair_default(false, Default) -> Default;
+parse_pair_default("", Default)    -> Default;
+parse_pair_default(Spec, _Default) -> two_of(string:tokens(Spec, ",")).
+
+with_services(StationA, StationB, RunId) ->
+    with_services_run(StationA, StationB, RunId, rounds()).
+
+with_services_run(StationA, StationB, RunId, Rounds) ->
+    on_service_a(macula_e2e_service:start(<<"a">>, StationA, RunId),
+                 StationB, RunId, Rounds).
+
+on_service_a({error, Reason}, _StationB, _RunId, _Rounds) ->
     [{service_a_start, {error, Reason}}];
-on_service_a({ok, A}, StationB, RunId) ->
+on_service_a({ok, A}, StationB, RunId, Rounds) ->
     Report = on_service_b(macula_e2e_service:start(<<"b">>, StationB, RunId),
-                          A),
+                          A, Rounds),
     macula_e2e_service:stop(A),
     Report.
 
-on_service_b({error, Reason}, _A) ->
+on_service_b({error, Reason}, _A, _Rounds) ->
     [{service_b_start, {error, Reason}}];
-on_service_b({ok, B}, A) ->
+on_service_b({ok, B}, A, Rounds) ->
     %% Advertises need to propagate to the far station before the first
     %% call crosses the hop, or the whole run measures propagation lag.
     timer:sleep(?SETTLE_MS),
-    Report = run(A, B),
+    Report = run(A, B, Rounds),
     macula_e2e_service:stop(B),
     Report.
 
@@ -223,6 +265,14 @@ rounds() ->
 
 -spec round_names() -> [atom()].
 round_names() -> [distinct_stations | rounds()].
+
+%% @doc The fault rounds — deliberately absent from `rounds/0' because
+%% each one disrupts a live station and must be run on purpose, never as
+%% a side effect of a routine duel.
+-spec fault_rounds() -> [atom()].
+fault_rounds() ->
+    [service_survives_station_pause,
+     service_survives_station_restart].
 
 %% @doc Render a report as lines an operator can read at a glance.
 -spec format(report()) -> iolist().
@@ -797,6 +847,152 @@ classify_sustained(Unique) ->
     {error, {sustained_delivery_incomplete, received, length(Unique),
              published, ?SUSTAINED_EVENTS,
              fraction, length(Unique) / ?SUSTAINED_EVENTS}}.
+
+%%====================================================================
+%% Fault injection — a service must survive its far station failing
+%%
+%% This is the stated end goal of the whole harness: "its far station
+%% restarts, its link drops, and it keeps working without an operator."
+%% Nothing exercised it before; `macula_e2e_fault' existed with no
+%% caller. These two rounds are the caller.
+%%
+%% Both restore the station in an `after' clause so a crashed assertion
+%% cannot leave a production leaf down. The runner (`run_one/3') catches
+%% exceptions rather than re-raising, so that `after' always runs before
+%% the failure is recorded.
+%%====================================================================
+
+%% @doc A brief freeze must not break delivery. `docker pause' SIGSTOPs
+%% the station's BEAM while its kernel sockets stay open, so the pool's
+%% link is not severed — this tests riding through a transient stall,
+%% the lighter failure, without a reconnect.
+service_survives_station_pause(A, B) ->
+    Station = macula_e2e_service:station(A),
+    Realm   = macula_e2e_service:realm(A),
+    Topic   = macula_e2e_service:topic(A, <<"pause">>),
+    PoolA   = macula_e2e_service:pool(A),
+    PoolB   = macula_e2e_service:pool(B),
+    {ok, Ref} = macula:subscribe(PoolA, Realm, Topic, self()),
+    timer:sleep(?SETTLE_MS),
+    Baseline = confirm_delivery(PoolB, Realm, Topic, Ref, <<"before">>),
+    on_baseline(Baseline,
+                fun() -> after_pause(Station, PoolA, PoolB, Realm, Topic, Ref) end).
+
+after_pause(Station, PoolA, PoolB, Realm, Topic, Ref) ->
+    _ = macula_e2e_fault:with_paused(Station, fun pause_hold/0),
+    timer:sleep(?SETTLE_MS),
+    R = confirm_delivery(PoolB, Realm, Topic, Ref, <<"after">>),
+    catch macula:unsubscribe(PoolA, Ref),
+    R.
+
+pause_hold() -> timer:sleep(?SETTLE_MS).
+
+%% @doc THE round: a service survives its own station being stopped and
+%% started, subscription intact.
+%%
+%% A subscribes (the wire subscription lands on A's station), B publishes
+%% and A receives — baseline. Then A's station is STOPPED, so its BEAM
+%% dies and the pool's link is genuinely severed. On start the station
+%% cold-boots, the pool redials, re-handshakes, and REPLAYS the
+%% subscription (`macula_client_replay:subs_to/2'). If replay works, B's
+%% next publish reaches A. If it does not, A is silently deaf after every
+%% station restart — which the fleet does daily on watchtower rolls.
+service_survives_station_restart(A, B) ->
+    Station = macula_e2e_service:station(A),
+    Realm   = macula_e2e_service:realm(A),
+    Topic   = macula_e2e_service:topic(A, <<"restart">>),
+    PoolA   = macula_e2e_service:pool(A),
+    PoolB   = macula_e2e_service:pool(B),
+    {ok, Ref} = macula:subscribe(PoolA, Realm, Topic, self()),
+    timer:sleep(?SETTLE_MS),
+    Baseline = confirm_delivery(PoolB, Realm, Topic, Ref, <<"before">>),
+    on_baseline(Baseline,
+                fun() -> after_restart(Station, PoolA, PoolB, Realm,
+                                       Topic, Ref) end).
+
+after_restart(Station, PoolA, PoolB, Realm, Topic, Ref) ->
+    Recovery = cycle_station(Station, PoolA),
+    on_recovery(Recovery, PoolA, PoolB, Realm, Topic, Ref).
+
+%% Only proceed to the fault if delivery worked first — otherwise a
+%% "survives" pass would be meaningless.
+on_baseline({error, Reason}, _Continue) ->
+    {error, {no_delivery_before_fault, Reason}};
+on_baseline(ok, Continue) ->
+    Continue().
+
+%% Stop the station, wait for the pool to notice, start it again, wait
+%% for a healthy link. The `after' guarantees the start even if a wait
+%% raises, so the station is never left down by a failed assertion.
+cycle_station(Station, PoolA) ->
+    ok = macula_e2e_fault:stop_station(Station),
+    Down = try wait_link(PoolA, down, ?FAULT_DOWN_WAIT_MS)
+           after catch macula_e2e_fault:start_station(Station)
+           end,
+    Up = wait_link(PoolA, up, ?FAULT_UP_WAIT_MS),
+    {Down, Up}.
+
+on_recovery({down, up}, PoolA, PoolB, Realm, Topic, Ref) ->
+    %% Link is back; give the replay a moment to re-establish the wire
+    %% subscription on the far station before testing delivery.
+    timer:sleep(?FAULT_REPLAY_MS),
+    R = confirm_delivery_retry(PoolB, Realm, Topic, Ref, <<"after">>, 3),
+    catch macula:unsubscribe(PoolA, Ref),
+    classify_restart(R);
+on_recovery({timeout, _Up}, _PoolA, _PoolB, _Realm, _Topic, _Ref) ->
+    {error, {link_never_dropped, the_stop_did_not_sever_the_link}};
+on_recovery({down, timeout}, _PoolA, _PoolB, _Realm, _Topic, _Ref) ->
+    {error, {link_never_recovered, pool_did_not_redial_after_start}}.
+
+classify_restart(ok) ->
+    ok;
+classify_restart({error, Reason}) ->
+    {error, {subscription_not_replayed_after_restart, Reason}}.
+
+%% Poll the pool's health until it matches the wanted edge, or time out.
+wait_link(Pool, Want, Budget) ->
+    wait_link(Pool, Want, Budget, erlang:monotonic_time(millisecond)).
+
+wait_link(Pool, Want, Budget, Start) ->
+    Elapsed = erlang:monotonic_time(millisecond) - Start,
+    wait_link_step(link_edge(Pool), Want, Pool, Budget, Start, Elapsed).
+
+wait_link_step(Want, Want, _Pool, _Budget, _Start, _Elapsed) ->
+    Want;
+wait_link_step(_Other, _Want, _Pool, Budget, _Start, Elapsed)
+  when Elapsed >= Budget ->
+    timeout;
+wait_link_step(_Other, Want, Pool, Budget, Start, _Elapsed) ->
+    timer:sleep(?FAULT_POLL_MS),
+    wait_link(Pool, Want, Budget, Start).
+
+link_edge(Pool) ->
+    case macula:status(Pool) of
+        {ok, #{healthy_links := N}} when N > 0 -> up;
+        _                                      -> down
+    end.
+
+%% One publish, one expected delivery, with a short wait.
+confirm_delivery(PubPool, Realm, Topic, Ref, Tag) ->
+    Payload = #{<<"phase">> => Tag},
+    ok = macula:publish(PubPool, Realm, Topic, Payload),
+    await_payload(Ref, Payload, ?EVENT_WAIT_MS).
+
+%% Same, but retried: after a restart the far station's re-established
+%% subscription and the routing between the two stations both need to
+%% settle, and "arrived on the second try" is recovery, not failure.
+confirm_delivery_retry(_PubPool, _Realm, _Topic, _Ref, _Tag, 0) ->
+    {error, no_delivery_after_restart};
+confirm_delivery_retry(PubPool, Realm, Topic, Ref, Tag, Left) ->
+    Payload = #{<<"phase">> => Tag, <<"try">> => Left},
+    ok = macula:publish(PubPool, Realm, Topic, Payload),
+    on_retry(await_payload(Ref, Payload, ?EVENT_WAIT_MS),
+             PubPool, Realm, Topic, Ref, Tag, Left).
+
+on_retry(ok, _PubPool, _Realm, _Topic, _Ref, _Tag, _Left) ->
+    ok;
+on_retry({error, _}, PubPool, Realm, Topic, Ref, Tag, Left) ->
+    confirm_delivery_retry(PubPool, Realm, Topic, Ref, Tag, Left - 1).
 
 %%====================================================================
 %% Shared helpers

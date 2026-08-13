@@ -119,26 +119,34 @@ gather(Pids) ->
 %% Internal — ssh fetch + BEAM eval
 %%====================================================================
 
-run_task({log_fetch, {Host, Container, Nick}, Since}, PrivDir) ->
+run_task({log_fetch, {_DialHost, Container, Nick}, Since}, PrivDir) ->
     OutPath = filename:join(PrivDir, Nick ++ "_logs.txt"),
     Cmd =
-        ssh_prefix() ++ Host ++
+        ssh_prefix(Nick) ++
         " 'docker logs --since " ++ Since ++ " " ++ Container ++
         " 2>&1' > " ++ OutPath ++ " 2>/dev/null",
     _ = os:cmd(Cmd),
     ok;
-run_task({state_dump, {Host, Container, Nick}}, PrivDir) ->
+run_task({state_dump, {_DialHost, Container, Nick}}, PrivDir) ->
     OutPath = filename:join(PrivDir, Nick ++ "_state.txt"),
     Cmd =
-        ssh_prefix() ++ Host ++
+        ssh_prefix(Nick) ++
         " \"docker exec " ++ Container ++
         " /opt/macula_station/bin/macula_station eval '" ++ eval_expr() ++ "'\""
         " > " ++ OutPath ++ " 2>&1",
     _ = os:cmd(Cmd),
     ok.
 
-ssh_prefix() ->
-    "ssh -i ~/.ssh/id_hetzner -o BatchMode=yes -o ConnectTimeout=10 root@".
+%% Resolve ssh through the fleet's ssh_target/1. This used to be a fixed
+%% `id_hetzner' prefix concatenated with the tuple's Host field. The
+%% 2026-08 fleet rewrite made that Host field the DIAL name
+%% (`station-fi-helsinki.macula.io'), which is not in known_hosts and is
+%% not the box, so this capture silently failed host-key verification on
+%% every station — and, being a failure-path capture, nobody noticed.
+ssh_prefix(Nick) ->
+    {SshHost, SshKey} = macula_e2e_fleet:ssh_target(Nick),
+    "ssh -i ~/.ssh/" ++ SshKey ++
+    " -o BatchMode=yes -o ConnectTimeout=10 root@" ++ SshHost.
 
 %% Multi-query BEAM snapshot. One `eval' call per station to avoid
 %% N round-trips. Returns a printable proplist; the release's `eval'
