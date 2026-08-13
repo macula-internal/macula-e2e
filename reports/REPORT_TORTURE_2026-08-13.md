@@ -349,7 +349,15 @@ it is a first-event or route-warmup loss that a rate hides.
 ### 5.5 The one-hop control run — three of four failures are MULTI-HOP ONLY
 
 The same 23 rounds against `station-fr-paris` ↔ `station-de-falkenstein`, a pair
-with a **direct edge in both directions**. One variable changed: hop count.
+with a **direct edge in both directions**.
+
+⚠ This originally claimed "one variable changed: hop count". It did not — the
+pairs differ in stations, provider and geography too, and one control run
+against intermittent failures proves little. Two further controls were run on
+direct edges **containing each suspect station** (helsinki↔paris and
+nuremberg↔falkenstein): both **22/23, ordering the only failure**. Both suspect
+stations therefore appear in a clean single-hop run, which excludes station
+identity and leaves hop count. See `ASSESSMENT_MACULA_2026-08-13.md` §3.2.
 
 | round | 2 hops (helsinki↔nuremberg) | 1 hop (paris↔falkenstein) |
 |---|---|---|
