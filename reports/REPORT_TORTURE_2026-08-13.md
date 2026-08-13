@@ -453,43 +453,118 @@ From the SDK audit, ranked by what a live service would feel. All are in
 
 ---
 
-## 9. What is corrected, and what is owed
+## 9. What shipped, and what it took
 
-**Corrected this session**
+29 commits across 9 repos. Every entry below is deployed and verified, not
+merely committed — that distinction turned out to be the whole story of the day.
 
-- `macula_e2e_fleet` — live seven-station topology, single source of truth,
-  with the two-hop pair named
-- `macula_e2e_reach` + `fleet-reach.sh` — reachability and identity-collision check
-- `macula-e2e` bumped `~> 7.0` → `~> 8.0`, verified green on the live fleet
-- `macula_e2e_service` + `macula_e2e_duel` — the two-service torture, 23 rounds
-- `station-udp-witness.sh`, `station-eval.sh` — the two instruments the milan
-  diagnosis needed and the repo did not have
-- `dht_find_records_by_type` round corrected to macula's actual contract
+### 9.1 Instruments built (macula-e2e)
 
-**Owed, ranked**
+| thing | what it answers |
+|---|---|
+| `macula_e2e_fleet` | the live seven-station topology, one source of truth, with the two-hop pair named |
+| `macula_e2e_reach` + `fleet-reach.sh` | which stations this vantage point can reach, and whether two names are one station |
+| `macula_e2e_service` + `macula_e2e_duel` + `duel.sh` | 23 rounds of every application primitive between two services on two stations |
+| `station-udp-witness.sh` | do a client's packets ARRIVE — splits "station broken" from "path broken" where ICMP cannot |
+| `station-eval.sh` | read a live station's internal state (admin ports are firewalled) |
+| `station-joined.sh` | the dead-but-healthy signature: conns held, zero outbound, no verified peers |
+| `station-topology-audit.sh` (macula-demo) | the dial graph and record layer as-built, all seven boxes |
+| `sync-station-compose.sh` (macula-demo) | push compose and apply it — see §9.4 for why this had to exist |
 
-1. Restart `macula-station-milan`, then give the station a liveness check that
-   asks the **wire**, not the application — a station that has sent zero packets
-   while holding N connections is dead and must say so
-2. Fix the multi-hop propagation path. §5.5 localises three separate failures
-   (re-advertise route loss, first-publish loss, content lateness) to whatever
-   carries state between two stations with no direct edge. One place, three
-   symptoms
-3. Decide and document pubsub ordering — and note it is **not** fixed by the
-   above, it fails worse on one hop than two
-4. Publish `hecate_om` with `{macula, "~> 8.0"}` — one line unblocks 22 services
-5. Bump `macula-station` (`~> 7.1` → `~> 8.0`) and `macula-torture`; nothing
-   breaks, both were verified against their call sites
-6. `macula_handler_dispatch` — refuse through an ERROR frame with `detail` set,
-   so hosted and SDK handlers share one contract
-7. Guard the three unprotected `is_connected/1` call sites in `macula_client`
-8. Rewire `torture-mesh.sh` and `torture-mesh-concurrent.sh` to read
-   `macula_e2e_fleet` instead of their own stale copies
-9. `macula_e2e_fault.erl` is complete, careful, docker-level fault injection
-   (pause/unpause/stop/start) that **nothing calls**. Link loss and replay have
-   zero coverage, and the fleet auto-rolls on every CI build of main — link loss
-   is a daily event, not an edge case. The gap between "we can make a station
-   disappear" and "we assert what happens when it does" is one round wide.
+### 9.2 Defects fixed and deployed
+
+**Wire-liveness tripwire** — `macula-station`, live on all seven stations and
+verified on hardware (`/wire` answering, checks incrementing at the 10s tick).
+While the kernel holds undelivered datagrams on our own listener socket, the
+dispatched-frame counter must advance. Plus dial-futility counters and
+`relay_ping`'s discarded error branch. Ships log-only; `halt` is commit 3,
+gated on two weeks clean.
+
+**Realm-side staleness** — `macula-realm`. A mute station cannot report its own
+muteness, so the realm now says `:live | :stale | :dark` per station and logs
+the transition into dark. The number was already on screen for the whole
+30-hour outage with no threshold on it.
+
+**Pool-crash guard** — `macula` 8.0.1/8.0.2. `status/1`, `links/1` and publish
+probed every link with a 1s `gen_server:call` from inside the pool's own
+process, and that call exits its caller on both `{noproc,_}` and `{timeout,_}`.
+The timeout path needs no race at all.
+
+**`getstat/2` no longer answers hardcoded zeros** — `macula`. It was a trap
+laid for exactly the monitor this session built.
+
+**Healthcheck that can fail** — all seven stations moved from `/status`
+(hardcoded 200, `curl -f` keys off the status code, could never fail) to
+`/wire`.
+
+**macula 8 across the fleet** — `hecate_om 0.10.0` published, `macula-station`
+and `macula-torture` bumped, all seven stations verified running
+`lib/macula-8.0.0`.
+
+**Renovate pointed at GitHub** — it had authenticated against Codeberg months
+after the repatriation and failed every scheduled run since 2026-08-08, which
+is why the macula bump had to be found by hand. ⚠ `RENOVATE_TOKEN` still needs
+replacing with a GitHub PAT.
+
+**The realm's dead config key** — `config/test.exs`, `dev.exs` and one
+`runtime.exs` block set `:reckon_db_data_dir`; the code reads
+`:reckon_db_data_root`. Tests were writing the event store into checked-in
+files. Production was unaffected via a second, correct block.
+
+### 9.3 Documents corrected against measurement
+
+- **FLEET.md** — the leaf claim was HALF true. Records populate on both leaves
+  now (17 each, milan tying paris for the largest routing table); SWIM does not
+  (`swim_members = 1` vs the core's 4). The blanket "treat leaf measurements as
+  unreliable" was discarding good data.
+- **topologies/eu/README.md** — retitled DHT/SWIM → SWIM, since only the SWIM
+  half survives.
+- **PLAN_MACULA_ROOT.md** — the mesh section claimed macula v0.35.4 and 156
+  relays. It is macula 8 and seven stations.
+
+### 9.4 The lesson the day actually taught
+
+Four changes were queued as "easy fixes". Each was small **as a code change** and
+large **as a deployment**, and the gap was always in the same place:
+
+| looked done | was not, because |
+|---|---|
+| milan reported healthy | its transport was dead; every signal derives from BEAM state |
+| healthcheck committed to git | watchtower recreates from the IMAGE and never re-reads compose |
+| `rebar3 compile` went green | it built against the OLD macula until an explicit `upgrade` |
+| macula 8.0.1 published | hex lists it and no resolver can see it |
+| the realm's test config pointed at tmp | it set a key nothing reads |
+
+**Every one is the same shape as the milan outage**: correct in git, inert on
+the wire, with nothing comparing the two. That is why `sync-station-compose.sh`
+prints the healthcheck before and after, and why every test this session was
+verified RED before its green was believed.
+
+---
+
+## 10. Open, ranked
+
+1. **hex has frozen macula's registry at 8.0.0.** 8.0.1 and 8.0.2 are both
+   listed by the API with valid downloadable tarballs and neither resolves;
+   `hecate_om 0.10.0` published minutes later resolves fine. Needs hex support,
+   not another version bump. **Blocks the pool-crash guard reaching stations.**
+2. **Multi-hop propagation.** §5.5 plus two further controls localise three
+   symptoms to hop count with station identity excluded. One place to look.
+3. **Resolve the per-publisher ordering bullet** in `PUBSUB_GUIDE.md`: does it
+   promise delivery order or only a monotonic `seq`? Seven runs, four pairs, no
+   clean run.
+4. **`macula_e2e_fault.erl` still has zero callers.** Link loss and replay have
+   no coverage and the fleet auto-rolls daily.
+5. **SWIM on both leaves**, stuck at 1 since 2026-07-27.
+6. **Frankfurt's 12,392 inbound peering workers**, all alive, against
+   stockholm's 10. Undiagnosed.
+7. **`macula_handler_dispatch`** — a station-hosted handler's `{error, _}`
+   returns inside a RESULT frame, so callers see `{ok, {error, _}}`.
+8. **`issue_wire_subs/4`** — same pool-fatal class as the guard above, but
+   guarding it trades a dead pool for a silently absent subscription. A
+   judgement call, not a one-liner.
+9. **`RENOVATE_TOKEN`** must become a GitHub PAT.
+10. **Commit 3** — let the tripwire halt. Gated on two weeks clean.
 
 ---
 
