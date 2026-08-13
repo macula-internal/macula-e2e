@@ -46,8 +46,8 @@
 %%%-------------------------------------------------------------------
 -module(macula_e2e_duel).
 
--export([main/0, main_fault/0, pair/0, run/2, run/3, rounds/0,
-         fault_rounds/0, round_names/0, format/1]).
+-export([main/0, main_fault/0, main_heal/0, pair/0, run/2, run/3, rounds/0,
+         fault_rounds/0, heal_rounds/0, round_names/0, format/1]).
 
 %% Individual rounds, exported so a CT suite can name one per test case.
 -export([distinct_stations/2,
@@ -72,7 +72,8 @@
          torture_concurrent_calls/2,
          torture_sustained_pubsub/2,
          service_survives_station_pause/2,
-         service_survives_station_restart/2]).
+         service_survives_station_restart/2,
+         rpc_readvertise_heals/2]).
 
 -define(SETTLE_MS,          3_000).
 -define(EVENT_WAIT_MS,      8_000).
@@ -96,6 +97,9 @@
 -define(FAULT_UP_WAIT_MS,  180_000).
 -define(FAULT_POLL_MS,       2_000).
 -define(FAULT_REPLAY_MS,    30_000).
+%% Poll a re-advertised cross-hop call past the 30s reconcile period.
+-define(HEAL_POLL_ATTEMPTS,   25).
+-define(HEAL_POLL_MS,       2_000).
 %% Bloom-exchange re-advertises a subscription to peers on ~30s cadence,
 %% so the far station learning the replayed sub can take a minute-plus
 %% after the link is back. Retry long enough to separate "slow to
@@ -138,6 +142,25 @@ main_fault() ->
     io:format("~n=== duel FAULT ~s ===~n  a (RESTARTED): ~s~n  b: ~s~n~n",
               [RunId, StationA, StationB]),
     Report = with_services_run(StationA, StationB, RunId, fault_rounds()),
+    io:format("~s", [format(Report)]),
+    halt(exit_code(Report)).
+
+%% @doc Verify the advertise-reconcile fix on the two-hop pair: run the
+%% re-advertise heal round, which polls PAST the ~30s reconcile period.
+%% Before the fix a wedged re-advertise was permanent, so this round
+%% timed out on ~half of runs; after it, a wedge heals within a reconcile
+%% period and the round passes every time. Run it repeatedly (see
+%% `scripts/duel-heal.sh') — the discriminator is zero permanent
+%% failures across many runs, not any single run.
+-spec main_heal() -> no_return().
+main_heal() ->
+    {ok, _} = application:ensure_all_started(macula),
+    {StationA, StationB} = parse_pair_default(os:getenv("MACULA_E2E_DUEL_PAIR"),
+                                              macula_e2e_fleet:two_hop_pair()),
+    RunId = run_id(),
+    io:format("~n=== duel HEAL ~s ===~n  a: ~s~n  b: ~s~n~n",
+              [RunId, StationA, StationB]),
+    Report = with_services_run(StationA, StationB, RunId, heal_rounds()),
     io:format("~s", [format(Report)]),
     halt(exit_code(Report)).
 
@@ -278,6 +301,12 @@ round_names() -> [distinct_stations | rounds()].
 fault_rounds() ->
     [service_survives_station_pause,
      service_survives_station_restart].
+
+%% @doc The advertise-reconcile verification round. Separate because it
+%% polls for ~50s, far longer than the routine rounds.
+-spec heal_rounds() -> [atom()].
+heal_rounds() ->
+    [rpc_readvertise_heals].
 
 %% @doc Render a report as lines an operator can read at a glance.
 -spec format(report()) -> iolist().
@@ -572,6 +601,43 @@ classify_readvertise_retry(ok, First) ->
     {error, {readvertise_took_over_12s, first_attempt, First}};
 classify_readvertise_retry({error, Second}, First) ->
     {error, {readvertise_never_restored_route, first, First, retry, Second}}.
+
+%% @doc Re-advertise must EVENTUALLY restore the route — within a reconcile
+%% period, not never.
+%%
+%% This is the verification for the advertise-reconcile fix in
+%% macula-station. The routine `rpc_readvertise_restores_serving' gives up
+%% at ~12s, which is inside the 30s reconcile window, so it still shows the
+%% wedge. This one unadvertises, re-advertises, and polls the cross-hop
+%% call for ~50s. Before the fix a wedged re-advertise was PERMANENT, so
+%% this timed out on the runs that wedged; after it, a wedge self-heals on
+%% the next reconcile and this passes. The signal is zero failures across
+%% many runs, since the immediate wedge rate is unchanged (~half) — only
+%% whether it recovers.
+rpc_readvertise_heals(A, B) ->
+    Live = rpc_echo(B, A),
+    on_heal_baseline(Live, A, B).
+
+on_heal_baseline({error, Reason}, _A, _B) ->
+    {error, {no_service_before_readvertise, Reason}};
+on_heal_baseline(ok, A, B) ->
+    ok = macula_e2e_service:unadvertise(B, <<"echo">>),
+    timer:sleep(?SETTLE_MS),
+    macula_e2e_service:advertise_all(B),
+    poll_echo_heals(A, B, ?HEAL_POLL_ATTEMPTS).
+
+poll_echo_heals(_A, _B, 0) ->
+    {error, {readvertise_never_healed, waited_ms, ?HEAL_POLL_ATTEMPTS * ?HEAL_POLL_MS}};
+poll_echo_heals(A, B, Left) ->
+    on_heal_poll(rpc_echo(B, A), A, B, Left).
+
+on_heal_poll(ok, _A, _B, Left) ->
+    Waited = (?HEAL_POLL_ATTEMPTS - Left) * ?HEAL_POLL_MS,
+    io:format("    healed after ~ps~n", [Waited div 1000]),
+    ok;
+on_heal_poll({error, _}, A, B, Left) ->
+    timer:sleep(?HEAL_POLL_MS),
+    poll_echo_heals(A, B, Left - 1).
 
 %% @doc A handler slower than the deadline must time out at the caller,
 %% and the caller must stay usable afterwards.
