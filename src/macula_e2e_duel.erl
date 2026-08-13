@@ -92,10 +92,15 @@
 %% milan) and the client pool then redials on its own backoff (up to
 %% ?MAX_BACKOFF 60s), so recovery can take well over a minute. Poll,
 %% don't sleep-once.
--define(FAULT_DOWN_WAIT_MS, 60_000).
+-define(FAULT_DWELL_MS,     12_000).
 -define(FAULT_UP_WAIT_MS,  180_000).
 -define(FAULT_POLL_MS,       2_000).
--define(FAULT_REPLAY_MS,    10_000).
+-define(FAULT_REPLAY_MS,    30_000).
+%% Bloom-exchange re-advertises a subscription to peers on ~30s cadence,
+%% so the far station learning the replayed sub can take a minute-plus
+%% after the link is back. Retry long enough to separate "slow to
+%% reconverge" from "never replayed".
+-define(FAULT_DELIVERY_RETRIES,   8).
 
 -type result()  :: ok | {error, term()}.
 -type report()  :: [{atom(), result()}].
@@ -911,8 +916,9 @@ service_survives_station_restart(A, B) ->
                                        Topic, Ref) end).
 
 after_restart(Station, PoolA, PoolB, Realm, Topic, Ref) ->
-    Recovery = cycle_station(Station, PoolA),
-    on_recovery(Recovery, PoolA, PoolB, Realm, Topic, Ref).
+    ok = macula_e2e_fault:stop_station(Station),
+    {Outage, LinkBack} = run_outage(Station, PoolA, PoolB, Realm, Topic, Ref),
+    finish_restart(Outage, LinkBack, PoolA, PoolB, Realm, Topic, Ref).
 
 %% Only proceed to the fault if delivery worked first — otherwise a
 %% "survives" pass would be meaningless.
@@ -921,55 +927,83 @@ on_baseline({error, Reason}, _Continue) ->
 on_baseline(ok, Continue) ->
     Continue().
 
-%% Stop the station, wait for the pool to notice, start it again, wait
-%% for a healthy link. The `after' guarantees the start even if a wait
-%% raises, so the station is never left down by a failed assertion.
-cycle_station(Station, PoolA) ->
-    ok = macula_e2e_fault:stop_station(Station),
-    Down = try wait_link(PoolA, down, ?FAULT_DOWN_WAIT_MS)
-           after catch macula_e2e_fault:start_station(Station)
-           end,
-    Up = wait_link(PoolA, up, ?FAULT_UP_WAIT_MS),
-    {Down, Up}.
+%% Station is stopped on entry. Prove the outage is REAL by confirming
+%% delivery has stopped (a publish from B, on a live station, must not
+%% reach A whose station is down), then start it back and wait for A's
+%% pool to reconnect.
+%%
+%% Confirming the outage from the client side, not from the down-edge of
+%% a health counter, is deliberate: a passive subscriber's pool may not
+%% notice a dead link for longer than any window worth waiting, and
+%% "delivery actually stopped" is a stronger fact than "a counter
+%% dipped" — it also cannot be fooled by a pool that reports a dead link
+%% as healthy.
+%%
+%% The `after' guarantees the restart even if a step raises.
+run_outage(Station, PoolA, PoolB, Realm, Topic, Ref) ->
+    try
+        timer:sleep(?FAULT_DWELL_MS),
+        Outage = outage_silent(PoolB, Realm, Topic, Ref),
+        ok = macula_e2e_fault:start_station(Station),
+        {Outage, wait_link_up(PoolA, ?FAULT_UP_WAIT_MS)}
+    after
+        catch macula_e2e_fault:start_station(Station)
+    end.
 
-on_recovery({down, up}, PoolA, PoolB, Realm, Topic, Ref) ->
+%% A publish from B while A's station is down must NOT reach A.
+outage_silent(PoolB, Realm, Topic, Ref) ->
+    _ = macula:publish(PoolB, Realm, Topic, #{<<"phase">> => <<"during">>}),
+    expect_no_delivery(Ref, ?SILENCE_WAIT_MS).
+
+finish_restart({error, delivered_during_outage}, _Up,
+               _PoolA, _PoolB, _Realm, _Topic, _Ref) ->
+    {error, {fault_did_not_take, delivery_continued_while_station_stopped}};
+finish_restart(ok, timeout, _PoolA, _PoolB, _Realm, _Topic, _Ref) ->
+    {error, {link_never_recovered, pool_did_not_redial_after_start}};
+finish_restart(ok, up, PoolA, PoolB, Realm, Topic, Ref) ->
     %% Link is back; give the replay a moment to re-establish the wire
     %% subscription on the far station before testing delivery.
     timer:sleep(?FAULT_REPLAY_MS),
-    R = confirm_delivery_retry(PoolB, Realm, Topic, Ref, <<"after">>, 3),
+    R = confirm_delivery_retry(PoolB, Realm, Topic, Ref, <<"after">>,
+                                          ?FAULT_DELIVERY_RETRIES),
     catch macula:unsubscribe(PoolA, Ref),
-    classify_restart(R);
-on_recovery({timeout, _Up}, _PoolA, _PoolB, _Realm, _Topic, _Ref) ->
-    {error, {link_never_dropped, the_stop_did_not_sever_the_link}};
-on_recovery({down, timeout}, _PoolA, _PoolB, _Realm, _Topic, _Ref) ->
-    {error, {link_never_recovered, pool_did_not_redial_after_start}}.
+    classify_restart(R).
 
 classify_restart(ok) ->
     ok;
 classify_restart({error, Reason}) ->
     {error, {subscription_not_replayed_after_restart, Reason}}.
 
-%% Poll the pool's health until it matches the wanted edge, or time out.
-wait_link(Pool, Want, Budget) ->
-    wait_link(Pool, Want, Budget, erlang:monotonic_time(millisecond)).
+%% Poll the pool until it has a healthy link again, or time out.
+wait_link_up(Pool, Budget) ->
+    wait_link_up(Pool, Budget, erlang:monotonic_time(millisecond)).
 
-wait_link(Pool, Want, Budget, Start) ->
+wait_link_up(Pool, Budget, Start) ->
     Elapsed = erlang:monotonic_time(millisecond) - Start,
-    wait_link_step(link_edge(Pool), Want, Pool, Budget, Start, Elapsed).
+    wait_link_step(healthy_links(Pool), Pool, Budget, Start, Elapsed).
 
-wait_link_step(Want, Want, _Pool, _Budget, _Start, _Elapsed) ->
-    Want;
-wait_link_step(_Other, _Want, _Pool, Budget, _Start, Elapsed)
-  when Elapsed >= Budget ->
+wait_link_step(N, _Pool, _Budget, _Start, _Elapsed) when N > 0 ->
+    up;
+wait_link_step(_N, _Pool, Budget, _Start, Elapsed) when Elapsed >= Budget ->
     timeout;
-wait_link_step(_Other, Want, Pool, Budget, Start, _Elapsed) ->
+wait_link_step(_N, Pool, Budget, Start, _Elapsed) ->
     timer:sleep(?FAULT_POLL_MS),
-    wait_link(Pool, Want, Budget, Start).
+    wait_link_up(Pool, Budget, Start).
 
-link_edge(Pool) ->
+healthy_links(Pool) ->
     case macula:status(Pool) of
-        {ok, #{healthy_links := N}} when N > 0 -> up;
-        _                                      -> down
+        {ok, #{healthy_links := N}} -> N;
+        _                           -> 0
+    end.
+
+%% Returns ok if nothing arrives in the window (the outage is real), or
+%% {error, delivered_during_outage} if a publish gets through anyway.
+expect_no_delivery(Ref, TimeoutMs) ->
+    receive
+        {macula_event, Ref, _Topic, _Payload, _Meta} ->
+            {error, delivered_during_outage}
+    after TimeoutMs ->
+        ok
     end.
 
 %% One publish, one expected delivery, with a short wait.

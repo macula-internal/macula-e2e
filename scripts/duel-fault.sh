@@ -31,7 +31,8 @@ cd "${REPO_ROOT}"
 # The first station of the pair is the one the rounds stop. Resolve its
 # box + key + container so the exit trap can force it back up regardless
 # of how the run ends.
-readonly TARGET_NICK="${MACULA_E2E_DUEL_PAIR%%,*}"
+readonly PAIR_SPEC="${MACULA_E2E_DUEL_PAIR:-}"
+readonly TARGET_NICK="${PAIR_SPEC%%,*}"
 readonly FAULT_NICK="${TARGET_NICK:-station-se-stockholm}"
 
 declare -A SSH_HOST=(
