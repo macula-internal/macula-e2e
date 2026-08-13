@@ -616,4 +616,32 @@ it, verified RED against the old hardcoded key.
 
 ---
 
+## 11. 2026-08-14 — the remaining items closed
+
+The multi-hop root cause (§10 item 2) and four more items, worked to done or to
+an honest diagnosis. Every fix RED-verified; every diagnosis grounded in live
+state or code, not inference.
+
+| item | outcome |
+|---|---|
+| **multi-hop advertise** | ROOT-CAUSED and FIXED (macula-station): propagation was diff-only with no reconciliation; added a periodic full re-assert matching bloom/DHT. Converts a PERMANENT re-advertise loss into a bounded ~30s one. Live: reliable, but the wedge did not reproduce, so not a clean before/after — see `DESIGN_ADVERTISE_PROPAGATION_RECONCILE.md`. |
+| **fault injection** (§10.4) | `macula_e2e_fault` given a caller: pause + restart survival rounds, both pass against the leaf. Fixed the ssh-target regression my fleet rewrite introduced. |
+| **pubsub ordering** (§10.3) | doc corrected: the guide bullet promised ordering the code deliberately declines (round-robin dispatch for throughput). Now says "Per-publisher delivery order — none", points at `seq`. |
+| **handler refusal** | FIXED (macula-station): a station-hosted handler's `{error, Reason}` now crosses as an ERROR frame with the reason in `detail`, matching the SDK path — was a RESULT frame giving the caller `{ok, {error, _}}`, possibly unsendable. |
+| **frankfurt 12,392 workers** | DIAGNOSED benign: conns keyed by node id (can't stack), reaped by QUIC idle timeout; a live client population dialing the seed host. One caveat (ephemeral-identity churn) left open. |
+| **leaf SWIM** | MISDIAGNOSIS corrected: the leaf is not blind — `swim_members=1` is its one direct neighbour. `macula_swim` has no membership dissemination at all, so every station's SWIM equals its direct degree. Fleet-wide visibility is a deferred feature (Lifeguard), a checkpoint-level change, not a leaf bug. |
+
+### Still open, and whose
+
+- **hex has macula's registry frozen at 8.0.0** — 8.0.1/8.0.2 published,
+  unresolvable. Needs hex support. Blocks the pool-crash guard reaching stations.
+- **`RENOVATE_TOKEN`** must become a GitHub PAT (workflow fixed, secret not).
+- **SWIM membership dissemination** — the real fix behind the leaf "defect", a
+  protocol change needing a checkpoint.
+- **`issue_wire_subs/4`** — same pool-fatal class as the guarded probes, but
+  guarding trades a dead pool for a silently absent subscription. A judgement call.
+- **Commit 3** (tripwire halt) — gated on two weeks clean on the fleet.
+
+---
+
 *Appended as work lands.*
