@@ -31,7 +31,8 @@
 -export([
     pause_station/1, unpause_station/1,
     stop_station/1, start_station/1,
-    with_paused/2, with_stopped/2
+    with_paused/2, with_stopped/2,
+    set_puzzle_mode/2
 ]).
 
 -type nick() :: string().
@@ -85,6 +86,32 @@ with_stopped(Nick, Fun) ->
     after _ = start_station(Nick)
     end.
 
+%% @doc Flip a live station's DHT-puzzle enforcement mode (`off' |
+%% `log_only' | `enforce'), read fresh per handshake by
+%% `macula_station_listener:puzzle_enforcement_mode/0'
+%% (`application:get_env(macula_station, puzzle_enforcement, off)') --
+%% no station restart needed for the flip to take effect.
+%%
+%% ⚠ `enforce' rejects ANY identity that predates the puzzle check,
+%% which today is the fleet's own inter-station identities too --
+%% flipping a station to `enforce' can disconnect it from its own
+%% upstream peer, not just refuse a deliberately-unhardened test
+%% connection. Never call this with `enforce' outside a round that
+%% flips back to `off' in an `after' clause, same discipline as
+%% `with_paused'/`with_stopped'.
+-spec set_puzzle_mode(nick(), off | log_only | enforce) ->
+    ok | {error, term()}.
+set_puzzle_mode(Nick, Mode)
+  when Mode =:= off; Mode =:= log_only; Mode =:= enforce ->
+    {SshHost, SshKey, Container} = host_container(Nick),
+    remote_eval(SshHost, SshKey, Container, puzzle_mode_expr(Mode)).
+
+puzzle_mode_expr(Mode) ->
+    lists:flatten(
+      io_lib:format(
+        "application:set_env(macula_station, puzzle_enforcement, ~p), ok.",
+        [Mode])).
+
 %%====================================================================
 %% Internals
 %%====================================================================
@@ -118,3 +145,34 @@ docker_op(SshHost, SshKey, Op, Container) ->
 
 docker_op_result(0, Op, Out) -> {error, {docker_op_failed, Op, Out}};
 docker_op_result(_, _Op, _Out) -> ok.
+
+%% Same ssh + explicit per-station key shape as `docker_op/4' above
+%% (see its own comment on why the key cannot be resolved implicitly
+%% across this fleet's boxes), reaching into the release's own `eval'
+%% instead of `docker OP Container' -- the admin API is firewalled
+%% from outside the box, so this is the only way to change a running
+%% station's config short of a restart. Base64-encodes the expression,
+%% the same reason `scripts/station-eval.sh' does for a human running
+%% the equivalent by hand: it survives the remote shell's re-parsing
+%% of parens and commas intact.
+remote_eval(SshHost, SshKey, Container, Expr) ->
+    Encoded = base64:encode(list_to_binary(Expr)),
+    RemoteCmd =
+        "docker exec " ++ Container ++
+        " /opt/macula_station/bin/macula_station eval "
+        "\"$(echo " ++ binary_to_list(Encoded) ++ " | base64 -d)\"",
+    Cmd =
+        "ssh -i ~/.ssh/" ++ SshKey ++ " -o BatchMode=yes "
+        "-o ConnectTimeout=15 root@" ++ SshHost ++ " '" ++ RemoteCmd ++
+        "' 2>/dev/null",
+    Out = os:cmd(Cmd),
+    remote_eval_result(Out).
+
+%% `eval''s last statement in `puzzle_mode_expr/1' is a bare `ok', so
+%% a successful flip prints exactly that. Anything else -- ssh
+%% failure, a crashed eval, wrong container -- does not.
+remote_eval_result(Out) ->
+    case string:trim(Out) of
+        "ok" -> ok;
+        Other -> {error, {remote_eval_failed, Other}}
+    end.

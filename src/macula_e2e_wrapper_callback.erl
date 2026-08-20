@@ -2,9 +2,10 @@
 %%% @doc Shared callback module for the supervised-primitive-wrapper
 %%% probes in `macula_e2e_probe' (macula 9.2.0's macula_subscriber /
 %%% macula_response / macula_request / macula_streamer /
-%%% macula_stream_sink / macula_feeder / macula_download).
+%%% macula_stream_sink / macula_feeder / macula_download, and macula
+%%% 9.4.0's macula_publisher).
 %%%
-%%% One module implements every callback these seven behaviours need
+%%% One module implements every callback these eight behaviours need
 %%% (`init/1' is shared verbatim across all of them) and forwards each
 %%% event to the parent pid passed as `Args', tagged so a single probe
 %%% process can `receive' unambiguously regardless of how many of
@@ -14,6 +15,7 @@
 -module(macula_e2e_wrapper_callback).
 
 -behaviour(macula_subscriber).
+-behaviour(macula_publisher).
 -behaviour(macula_response).
 -behaviour(macula_request).
 -behaviour(macula_streamer).
@@ -23,6 +25,7 @@
 
 -export([init/1,
          handle_event/4,
+         handle_published/2,
          handle_request/2,
          handle_reply/2,
          handle_open/2,
@@ -37,6 +40,11 @@ init(Parent) -> {ok, Parent}.
 handle_event(Topic, Payload, Meta, Parent) ->
     Parent ! {e2e_wrapper, sub_event, Topic, Payload, Meta},
     {noreply, Parent}.
+
+%% macula_publisher (producer side of pubsub)
+handle_published(Result, Parent) ->
+    Parent ! {e2e_wrapper, published, Result},
+    {stop, normal, Parent}.
 
 %% macula_response (provider side of RPC) — echoes the payload back
 %% wrapped under an `echo' key, mirroring `unary_rpc/4''s handler.

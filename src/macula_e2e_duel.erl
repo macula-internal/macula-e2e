@@ -46,8 +46,10 @@
 %%%-------------------------------------------------------------------
 -module(macula_e2e_duel).
 
--export([main/0, main_fault/0, main_heal/0, pair/0, run/2, run/3, rounds/0,
-         fault_rounds/0, heal_rounds/0, round_names/0, format/1]).
+-export([main/0, main_fault/0, main_heal/0, main_puzzle/0,
+         pair/0, run/2, run/3, rounds/0,
+         fault_rounds/0, heal_rounds/0, puzzle_rounds/0,
+         round_names/0, format/1]).
 
 %% Individual rounds, exported so a CT suite can name one per test case.
 -export([distinct_stations/2,
@@ -73,7 +75,14 @@
          torture_sustained_pubsub/2,
          service_survives_station_pause/2,
          service_survives_station_restart/2,
-         rpc_readvertise_heals/2]).
+         rpc_readvertise_heals/2,
+         pubsub_wrapper_cross/2,
+         rpc_wrapper_cross/2,
+         streaming_wrapper_cross/2,
+         content_wrapper_cross/2,
+         quic_isolation_rpc_survives_large_content/2,
+         dht_puzzle_accept/2,
+         puzzle_reject_on_enforce/2]).
 
 -define(SETTLE_MS,          3_000).
 -define(EVENT_WAIT_MS,      8_000).
@@ -105,6 +114,35 @@
 %% after the link is back. Retry long enough to separate "slow to
 %% reconverge" from "never replayed".
 -define(FAULT_DELIVERY_RETRIES,   8).
+
+%% Content over the 256 KiB chunk threshold, so a wrapper_cross feed
+%% triggers a chunked put and therefore a content_announcement -- a
+%% download_direct round with nothing under 256 KiB has no
+%% announcement to resolve at all.
+-define(WRAPPER_CONTENT_SIZE, 300_000).
+%% A resolve can race DHT propagation (see CHANGELOG's
+%% station_endpoint/content_announcement TTL-vs-replication-interval
+%% notes) -- retry the whole feed+download attempt, not just the
+%% resolve inside it, so "propagation was merely slow" and "never
+%% arrives" are told apart the same way content_size_axis already
+%% does for the plain path.
+-define(WRAPPER_DIRECT_RETRIES,   3).
+-define(WRAPPER_DIRECT_RETRY_MS, 5_000).
+-define(WRAPPER_DIRECT_TIMEOUT_MS, 20_000).
+
+%% QUIC isolation round: a feed past the chunk boundary, large enough
+%% that transfer time dwarfs a unary call's own latency budget, so a
+%% call stalled BEHIND it (no per-stream isolation) is unmistakable
+%% from one merely queued behind normal jitter.
+-define(ISOLATION_CONTENT_SIZE, 1_048_576).
+-define(ISOLATION_RPC_CALLS,          5).
+%% A call riding its own isolated stream should complete near
+%% ?CALL_TIMEOUT_MS's own normal latency, not the seconds a 1 MiB
+%% transfer over the same connection would take if genuinely stalled
+%% behind it. Generous margin over ordinary RTT, tight against "stalled
+%% behind the blob" (which would need most of the transfer's own
+%% duration, several seconds).
+-define(ISOLATION_RPC_BUDGET_MS, 3_000).
 
 -type result()  :: ok | {error, term()}.
 -type report()  :: [{atom(), result()}].
@@ -161,6 +199,25 @@ main_heal() ->
     io:format("~n=== duel HEAL ~s ===~n  a: ~s~n  b: ~s~n~n",
               [RunId, StationA, StationB]),
     Report = with_services_run(StationA, StationB, RunId, heal_rounds()),
+    io:format("~s", [format(Report)]),
+    halt(exit_code(Report)).
+
+%% @doc Stand two services up and run ONLY the DHT-puzzle rounds. Kept
+%% separate from `main/0' for the same reason as `main_fault/0': the
+%% reject-path round temporarily flips a live station's puzzle
+%% enforcement mode, so it must never run as a side effect of a
+%% routine duel. Defaults to the same leaf-first pair as the fault
+%% rounds -- stockholm (service A here, same as `fault_pair/0' puts it
+%% for `main_fault/0') is a degree-1 leaf, so its config flip and the
+%% brief connect-refusal it causes affect nothing that routes through it.
+-spec main_puzzle() -> no_return().
+main_puzzle() ->
+    {ok, _} = application:ensure_all_started(macula),
+    {StationA, StationB} = fault_pair(),
+    RunId = run_id(),
+    io:format("~n=== duel PUZZLE ~s ===~n  a (ENFORCEMENT FLIPPED): ~s~n  b: ~s~n~n",
+              [RunId, StationA, StationB]),
+    Report = with_services_run(StationA, StationB, RunId, puzzle_rounds()),
     io:format("~s", [format(Report)]),
     halt(exit_code(Report)).
 
@@ -289,7 +346,13 @@ rounds() ->
      content_put_get_cross,
      content_size_axis,
      torture_concurrent_calls,
-     torture_sustained_pubsub].
+     torture_sustained_pubsub,
+     pubsub_wrapper_cross,
+     rpc_wrapper_cross,
+     streaming_wrapper_cross,
+     content_wrapper_cross,
+     quic_isolation_rpc_survives_large_content,
+     dht_puzzle_accept].
 
 -spec round_names() -> [atom()].
 round_names() -> [distinct_stations | rounds()].
@@ -307,6 +370,16 @@ fault_rounds() ->
 -spec heal_rounds() -> [atom()].
 heal_rounds() ->
     [rpc_readvertise_heals].
+
+%% @doc The DHT-puzzle REJECT round — deliberately absent from
+%% `rounds/0' because it flips a live station's puzzle enforcement
+%% mode and must be run on purpose, never as a side effect of a
+%% routine duel (same discipline as `fault_rounds/0'). The accept-path
+%% round (`dht_puzzle_accept') is zero-risk -- no config touched -- and
+%% already lives in `rounds/0' itself; it is not duplicated here.
+-spec puzzle_rounds() -> [atom()].
+puzzle_rounds() ->
+    [puzzle_reject_on_enforce].
 
 %% @doc Render a report as lines an operator can read at a glance.
 -spec format(report()) -> iolist().
@@ -918,6 +991,408 @@ classify_sustained(Unique) ->
     {error, {sustained_delivery_incomplete, received, length(Unique),
              published, ?SUSTAINED_EVENTS,
              fraction, length(Unique) / ?SUSTAINED_EVENTS}}.
+
+%%====================================================================
+%% Cross-station supervised-primitive wrappers (macula 9.4.0-9.8.0)
+%%
+%% Same four wire operations as the routine rounds above, but driven
+%% through the supervised OTP-behaviour wrappers, and -- for the three
+%% pairs that have one -- via DIRECT-DIAL specifically: resolve the
+%% far side from a signed DHT record and dial it in one hop, instead
+%% of depending on advertise-gossip having propagated a route between
+%% these two particular stations, which is exactly what a service
+%% deployed to any two arbitrary stations cannot assume. Pubsub has no
+%% direct-dial counterpart (Plumtree gossip, not a resolvable station
+%% -- see `pubsub_two_stations.svg'), so its round stays on the
+%% existing gossip-routed mechanism; it is still worth proving the
+%% supervised wrapper pair itself survives a real cross-station hop.
+%%====================================================================
+
+%% @doc `macula_publisher' / `macula_subscriber', cross-station,
+%% gossip-routed (pubsub's only mechanism).
+pubsub_wrapper_cross(A, B) ->
+    Realm = macula_e2e_service:realm(A),
+    Topic = macula_e2e_service:topic(A, <<"wrapper_cross">>),
+    {ok, SubPid} = macula_subscriber:start_link(
+                     macula_e2e_wrapper_callback, macula_e2e_service:pool(B),
+                     Realm, Topic, self()),
+    timer:sleep(?SETTLE_MS),
+    Token = crypto:strong_rand_bytes(16),
+    Payload = #{<<"token">> => Token},
+    {ok, PubPid} = macula_publisher:start_link(
+                     macula_e2e_wrapper_callback, macula_e2e_service:pool(A),
+                     Realm, Topic, Payload, self()),
+    Result = await_wrapper_pub_sub(Topic, Payload, ?EVENT_WAIT_MS),
+    catch gen_server:stop(SubPid),
+    catch gen_server:stop(PubPid),
+    Result.
+
+%% Both the publisher's own outcome AND the subscriber's delivered
+%% event must be observed -- a publisher reporting `ok' while nothing
+%% arrives, or an arrival despite a reported publish failure, are both
+%% real defects a single-sided check would miss.
+await_wrapper_pub_sub(Topic, Payload, TimeoutMs) ->
+    await_wrapper_pub_sub(Topic, Payload, TimeoutMs, undefined, undefined).
+
+await_wrapper_pub_sub(_Topic, _Payload, _TimeoutMs, PubDone, SubDone)
+        when PubDone =/= undefined, SubDone =/= undefined ->
+    classify_pub_sub(PubDone, SubDone);
+await_wrapper_pub_sub(Topic, Payload, TimeoutMs, PubDone, SubDone) ->
+    receive
+        {e2e_wrapper, published, Result} ->
+            await_wrapper_pub_sub(Topic, Payload, TimeoutMs, Result, SubDone);
+        {e2e_wrapper, sub_event, Topic, Got, _Meta} ->
+            Match = normalise_keys(Got) =:= normalise_keys(Payload),
+            await_wrapper_pub_sub(Topic, Payload, TimeoutMs, PubDone,
+                                  {Match, Got})
+    after TimeoutMs ->
+        classify_pub_sub_timeout(PubDone, SubDone)
+    end.
+
+classify_pub_sub(ok, {true, _Got})  -> ok;
+classify_pub_sub(ok, {false, Got})  -> {error, {payload_mismatch, Got}};
+classify_pub_sub({error, _} = E, _) -> E.
+
+classify_pub_sub_timeout(undefined, _) -> {error, publish_never_reported};
+classify_pub_sub_timeout(_, undefined) -> {error, no_event};
+classify_pub_sub_timeout(PubDone, SubDone) ->
+    {error, {unexpected_state, PubDone, SubDone}}.
+
+%% @doc `macula_response' / `macula_request', cross-station, via
+%% DIRECT-DIAL: B publishes a discoverable `procedure_advertisement'
+%% (`advertise_direct/6'), A resolves it and dials B in one hop
+%% (`start_link_direct/7').
+rpc_wrapper_cross(A, B) ->
+    Realm     = macula_e2e_service:realm(A),
+    Procedure = macula_e2e_service:procedure(B, <<"wrapper_cross">>),
+    Identity  = macula_identity:generate(),
+    {ok, Sup} = macula_response:advertise_direct(
+                  macula_e2e_service:pool(B), Realm, Procedure,
+                  macula_e2e_wrapper_callback, self(), Identity),
+    timer:sleep(?SETTLE_MS),
+    Args = #{<<"x">> => 42},
+    {ok, ReqPid} = macula_request:start_link_direct(
+                     macula_e2e_wrapper_callback, macula_e2e_service:pool(A),
+                     Realm, Procedure, Args, ?WRAPPER_DIRECT_TIMEOUT_MS, self()),
+    Result = await_wrapper_reply(Args, ?WRAPPER_DIRECT_TIMEOUT_MS),
+    catch gen_server:stop(ReqPid),
+    catch macula_response:unadvertise(macula_e2e_service:pool(B), Realm, Procedure),
+    unlink(Sup),
+    exit(Sup, shutdown),
+    Result.
+
+await_wrapper_reply(Args, TimeoutMs) ->
+    receive
+        {e2e_wrapper, req_reply, Reply} -> classify_wrapper_reply(Reply, Args)
+    after TimeoutMs ->
+        {error, {no_reply, expected, Args}}
+    end.
+
+classify_wrapper_reply({ok, #{echo := Got}}, Args) ->
+    classify_match(normalise_keys(Got) =:= normalise_keys(Args), Got, Args);
+classify_wrapper_reply({ok, #{<<"echo">> := Got}}, Args) ->
+    classify_match(normalise_keys(Got) =:= normalise_keys(Args), Got, Args);
+classify_wrapper_reply({ok, Other}, Args) ->
+    {error, {unexpected_reply, Other, expected, Args}};
+classify_wrapper_reply({error, _} = E, _) ->
+    E.
+
+%% @doc `macula_streamer' / `macula_stream_sink', cross-station, via
+%% DIRECT-DIAL. Same shape as `rpc_wrapper_cross/2': one hop to B's own
+%% resolved station, not dependent on a gossip-propagated route
+%% existing between A and B.
+streaming_wrapper_cross(A, B) ->
+    Realm     = macula_e2e_service:realm(A),
+    Procedure = macula_e2e_service:procedure(B, <<"wrapper_cross_stream">>),
+    Identity  = macula_identity:generate(),
+    {ok, StreamerSup} = macula_streamer:advertise_direct(
+                           macula_e2e_service:pool(B), Realm, Procedure,
+                           macula_e2e_wrapper_callback, self(), Identity),
+    timer:sleep(?SETTLE_MS),
+    {ok, SinkPid} = macula_stream_sink:start_link_direct(
+                      macula_e2e_wrapper_callback, macula_e2e_service:pool(A),
+                      Realm, Procedure, self()),
+    Result = wrapper_stream_exchange(),
+    catch gen_server:stop(SinkPid),
+    catch macula_streamer:unadvertise(macula_e2e_service:pool(B), Realm, Procedure),
+    unlink(StreamerSup),
+    exit(StreamerSup, shutdown),
+    Result.
+
+wrapper_stream_exchange() ->
+    receive
+        {e2e_wrapper, stream_opened, _Args, StreamerPid} ->
+            wrapper_stream_send(StreamerPid)
+    after ?WRAPPER_DIRECT_TIMEOUT_MS ->
+        {error, no_stream_opened}
+    end.
+
+wrapper_stream_send(StreamerPid) ->
+    ok = macula_streamer:send(StreamerPid, <<"e2e-wrapper-cross-chunk">>),
+    wrapper_stream_close(StreamerPid, wrapper_await_chunk()).
+
+wrapper_await_chunk() ->
+    receive
+        {e2e_wrapper, sink_chunk, <<"e2e-wrapper-cross-chunk">>} -> ok;
+        {e2e_wrapper, sink_chunk, Other} -> {error, {unexpected_chunk, Other}}
+    after ?EVENT_WAIT_MS -> {error, chunk_timeout}
+    end.
+
+wrapper_stream_close(StreamerPid, ok) ->
+    ok = macula_streamer:close(StreamerPid),
+    receive
+        {e2e_wrapper, sink_closed, _Reason} -> ok
+    after ?EVENT_WAIT_MS -> {error, close_timeout}
+    end;
+wrapper_stream_close(_StreamerPid, Error) ->
+    Error.
+
+%% @doc `macula_feeder' / `macula_download', cross-station. A feeds via
+%% the ordinary pooled `macula_feeder:start_link/5' -- content over the
+%% 256 KiB chunk threshold, so the put triggers an automatic
+%% `content_announcement', nothing to advertise explicitly. B downloads
+%% via `macula_download:start_link_direct/4,5', DIRECT-DIALING A's
+%% station to fetch it -- the harder, interesting direction, and the
+%% one direct-dial download actually exists for. Retries the WHOLE
+%% feed+download attempt, not just the resolve inside it, since a
+%% resolve can race DHT propagation of the announcement (the exact
+%% class of issue documented in CHANGELOG.md around
+%% station_endpoint/content_announcement TTL vs. replication cadence).
+content_wrapper_cross(A, B) ->
+    content_wrapper_cross_attempt(A, B, ?WRAPPER_DIRECT_RETRIES).
+
+content_wrapper_cross_attempt(_A, _B, 0) ->
+    {error, content_direct_dial_never_resolved};
+content_wrapper_cross_attempt(A, B, Left) ->
+    Realm = macula_e2e_service:realm(A),
+    Bytes = crypto:strong_rand_bytes(?WRAPPER_CONTENT_SIZE),
+    {ok, FeederPid} = macula_feeder:start_link(
+                        macula_e2e_wrapper_callback, macula_e2e_service:pool(A),
+                        Realm, Bytes, self()),
+    FedResult = receive
+        {e2e_wrapper, fed, {ok, Mcid}} -> {ok, Mcid};
+        {e2e_wrapper, fed, Other} -> {error, {feed_failed, Other}}
+    after ?WRAPPER_DIRECT_TIMEOUT_MS -> {error, feed_timeout}
+    end,
+    catch gen_server:stop(FeederPid),
+    on_wrapper_fed(FedResult, A, B, Realm, Bytes, Left).
+
+on_wrapper_fed({error, _} = E, _A, _B, _Realm, _Bytes, _Left) ->
+    E;
+on_wrapper_fed({ok, Mcid}, A, B, Realm, Bytes, Left) ->
+    {ok, DownloaderPid} = macula_download:start_link_direct(
+                            macula_e2e_wrapper_callback, macula_e2e_service:pool(B),
+                            Realm, Mcid, self()),
+    Result = receive
+        {e2e_wrapper, downloaded, {ok, Bytes}} -> ok;
+        {e2e_wrapper, downloaded, {ok, Other}} ->
+            {error, {content_mismatch, byte_size(Bytes), byte_size(Other)}};
+        {e2e_wrapper, downloaded, Other} -> {error, {download_failed, Other}}
+    after ?WRAPPER_DIRECT_TIMEOUT_MS -> {error, download_timeout}
+    end,
+    catch gen_server:stop(DownloaderPid),
+    on_wrapper_download(Result, A, B, Left).
+
+on_wrapper_download(ok, _A, _B, _Left) ->
+    ok;
+on_wrapper_download({error, _} = E, _A, _B, 1) ->
+    E;
+on_wrapper_download({error, _}, A, B, Left) ->
+    timer:sleep(?WRAPPER_DIRECT_RETRY_MS),
+    content_wrapper_cross_attempt(A, B, Left - 1).
+
+%%====================================================================
+%% QUIC per-stream isolation — the "sharper live head-of-line-blocking
+%% demonstration" PLAN_PER_STREAM_QUIC_ISOLATION.md left as its one
+%% open checklist item.
+%%====================================================================
+
+%% @doc B resolves A's content endpoint ONCE and reuses that exact URL
+%% for both a large download and several concurrent unary RPC calls, so
+%% both genuinely ride the SAME QUIC connection -- proving isolation
+%% requires that, not just "separate stations". Asserts the RPC calls
+%% complete within their normal latency budget while the download is in
+%% flight, not stalled behind it.
+quic_isolation_rpc_survives_large_content(A, B) ->
+    Realm = macula_e2e_service:realm(A),
+    Bytes = crypto:strong_rand_bytes(?ISOLATION_CONTENT_SIZE),
+    Fed = isolation_feed_and_await(A, Realm, Bytes),
+    on_isolation_fed(Fed, A, B, Realm, Bytes).
+
+isolation_feed_and_await(A, Realm, Bytes) ->
+    {ok, FeederPid} = macula_feeder:start_link(
+                        macula_e2e_wrapper_callback, macula_e2e_service:pool(A),
+                        Realm, Bytes, self()),
+    Result = receive
+        {e2e_wrapper, fed, {ok, Mcid}} -> {ok, Mcid};
+        {e2e_wrapper, fed, Other} -> {error, {feed_failed, Other}}
+    after ?WRAPPER_DIRECT_TIMEOUT_MS -> {error, feed_timeout}
+    end,
+    catch gen_server:stop(FeederPid),
+    Result.
+
+on_isolation_fed({error, _} = E, _A, _B, _Realm, _Bytes) -> E;
+on_isolation_fed({ok, Mcid}, A, B, Realm, Bytes) ->
+    on_isolation_resolved(
+      macula_direct_dial:resolve_content_provider(macula_e2e_service:pool(B), Mcid),
+      A, B, Realm, Mcid, Bytes).
+
+on_isolation_resolved({error, Reason}, _A, _B, _Realm, _Mcid, _Bytes) ->
+    {error, {content_not_resolved, Reason}};
+on_isolation_resolved(#{endpoint := Url, announcer_node := Node},
+                      A, B, Realm, Mcid, Bytes) ->
+    Self = self(),
+    TrustOpts = #{expected_node_id => Node, pin_tls_cert => false, verify => none},
+    PoolB = macula_e2e_service:pool(B),
+    {DlPid, DlMon} = spawn_monitor(fun() ->
+        Result = macula:get_content_station(PoolB, Url, Mcid,
+                                            ?WRAPPER_DIRECT_TIMEOUT_MS, TrustOpts),
+        Self ! {isolation_download, Result}
+    end),
+    %% Let the download actually open its dedicated stream before the
+    %% concurrent calls fire, so they land while the transfer is
+    %% genuinely in flight rather than racing its own setup.
+    timer:sleep(200),
+    Procedure = macula_e2e_service:procedure(A, <<"echo">>),
+    RpcResults = [timed_isolation_rpc(PoolB, Realm, Procedure, Url, TrustOpts, I)
+                  || I <- lists:seq(1, ?ISOLATION_RPC_CALLS)],
+    DownloadResult = await_isolation_download(DlPid, DlMon, Bytes),
+    classify_isolation(RpcResults, DownloadResult).
+
+timed_isolation_rpc(PoolB, Realm, Procedure, Url, TrustOpts, I) ->
+    Started = erlang:monotonic_time(millisecond),
+    Reply = macula:call_station(PoolB, Url, Realm, Procedure, #{<<"i">> => I},
+                                ?CALL_TIMEOUT_MS, <<>>, TrustOpts),
+    Elapsed = erlang:monotonic_time(millisecond) - Started,
+    {I, Elapsed, Reply}.
+
+await_isolation_download(DlPid, DlMon, Bytes) ->
+    receive
+        {isolation_download, {ok, Bytes}} ->
+            erlang:demonitor(DlMon, [flush]),
+            ok;
+        {isolation_download, {ok, Other}} ->
+            erlang:demonitor(DlMon, [flush]),
+            {error, {content_mismatch, byte_size(Bytes), byte_size(Other)}};
+        {isolation_download, {error, _} = E} ->
+            erlang:demonitor(DlMon, [flush]),
+            E;
+        {'DOWN', DlMon, process, DlPid, Reason} ->
+            {error, {download_worker_died, Reason}}
+    after ?WRAPPER_DIRECT_TIMEOUT_MS * 2 ->
+        erlang:demonitor(DlMon, [flush]),
+        exit(DlPid, kill),
+        {error, download_timeout}
+    end.
+
+classify_isolation(RpcResults, {error, _} = DownloadError) ->
+    {error, {download_failed, DownloadError, rpc_timings, RpcResults}};
+classify_isolation(RpcResults, ok) ->
+    Slow = [{I, Elapsed} || {I, Elapsed, _Reply} <- RpcResults,
+                            Elapsed > ?ISOLATION_RPC_BUDGET_MS],
+    Failed = [{I, Reply} || {I, _Elapsed, Reply} <- RpcResults,
+                            not is_ok_reply(Reply)],
+    classify_isolation_detail(Slow, Failed, RpcResults).
+
+is_ok_reply({ok, _}) -> true;
+is_ok_reply(_)        -> false.
+
+classify_isolation_detail([], [], _RpcResults) -> ok;
+classify_isolation_detail(Slow, [], RpcResults) ->
+    {error, {rpc_stalled_behind_content, slow_calls, Slow, all_timings, RpcResults}};
+classify_isolation_detail(_Slow, Failed, RpcResults) ->
+    {error, {rpc_failed_during_content_transfer, Failed, all_timings, RpcResults}}.
+
+%%====================================================================
+%% DHT puzzle (S/Kademlia Sybil defense) — never exercised end-to-end
+%% before this. `macula_station_listener:puzzle_decision/2': three
+%% modes (`off'/`log_only'/`enforce'), default `off', read fresh per
+%% handshake via `application:get_env(macula_station, puzzle_enforcement,
+%% off)' -- no restart needed to flip. No deployed station sets this
+%% today, so the whole fleet enforces nothing.
+%%====================================================================
+
+%% @doc Accept path: a puzzle-hardened identity connects to B's
+%% station and can still make a plain call. Zero fleet risk -- no
+%% config touched, exercises the existing default (`off', where every
+%% identity is accepted regardless of puzzle validity) -- but proves a
+%% VALID puzzle identity specifically is never rejected on principle.
+dht_puzzle_accept(_A, B) ->
+    Identity = macula_identity:generate(#{puzzle => true}),
+    Seed = macula_e2e_fleet:seed_url(macula_e2e_service:station(B)),
+    on_puzzle_connect(macula:connect([Seed], #{identity => Identity}), B).
+
+on_puzzle_connect({error, _} = E, _B) -> E;
+on_puzzle_connect({ok, Pool}, B) ->
+    Result = on_puzzle_healthy(wait_puzzle_healthy(Pool, 15_000), Pool, B),
+    catch macula:close(Pool),
+    Result.
+
+wait_puzzle_healthy(Pool, Left) when Left =< 0 ->
+    {error, {timeout, macula:status(Pool)}};
+wait_puzzle_healthy(Pool, Left) ->
+    case macula:status(Pool) of
+        {ok, #{healthy_links := N}} when N > 0 -> ok;
+        _ -> timer:sleep(500), wait_puzzle_healthy(Pool, Left - 500)
+    end.
+
+on_puzzle_healthy({error, _} = E, _Pool, _B) -> E;
+on_puzzle_healthy(ok, Pool, B) ->
+    %% A trivial DHT round-trip proves the connection is genuinely
+    %% usable, not merely "handshake completed".
+    {Signed, Key} = fresh_record(macula_e2e_service:realm(B)),
+    on_puzzle_put(macula:put_record(Pool, Signed), Pool, Key).
+
+on_puzzle_put({error, _} = E, _Pool, _Key) -> E;
+on_puzzle_put(ok, Pool, Key) ->
+    timer:sleep(?SETTLE_MS),
+    classify_found(macula:find_record(Pool, Key), Key).
+
+%% @doc Reject path: with B's station flipped to `enforce', a connect
+%% from a NON-puzzle-hardened identity must be refused. The actual
+%% station-side behaviour is a silent `macula_peering:close/2' during
+%% handshake (`macula_station_listener:reject_handshake/3'), not a
+%% wire-level error frame, so the observable client-side shape is
+%% "never becomes healthy", not a specific error code.
+%%
+%% Flips B back to `off' in an `after' clause no matter what happens,
+%% mirroring `with_paused'/`with_stopped''s guaranteed-recovery
+%% pattern, and does nothing else while `enforce' is live: this is NOT
+%% risk-free the way the accept round is.
+%% `macula_station_listener''s own moduledoc warns that `enforce'
+%% rejects ANY identity that predates the puzzle check, which today is
+%% the ENTIRE FLEET'S OWN inter-station identities -- flipping B can
+%% disconnect it from its own upstream peer for the duration, not just
+%% refuse this one test connection. Deliberately absent from
+%% `rounds/0'; run only via `main_puzzle/0'.
+puzzle_reject_on_enforce(_A, B) ->
+    Station = macula_e2e_service:station(B),
+    ok = macula_e2e_fault:set_puzzle_mode(Station, enforce),
+    try
+        attempt_non_puzzle_connect(Station)
+    after
+        catch macula_e2e_fault:set_puzzle_mode(Station, off)
+    end.
+
+attempt_non_puzzle_connect(Station) ->
+    Seed = macula_e2e_fleet:seed_url(Station),
+    Identity = macula_identity:generate(),  %% deliberately NOT puzzle-hardened
+    {ok, Pool} = macula:connect([Seed], #{identity => Identity}),
+    Result = classify_reject(wait_reject_settled(Pool, 15_000)),
+    catch macula:close(Pool),
+    Result.
+
+wait_reject_settled(_Pool, Left) when Left =< 0 ->
+    never_healthy;
+wait_reject_settled(Pool, Left) ->
+    case macula:status(Pool) of
+        {ok, #{healthy_links := N}} when N > 0 -> unexpectedly_healthy;
+        _ -> timer:sleep(500), wait_reject_settled(Pool, Left - 500)
+    end.
+
+classify_reject(never_healthy)        -> ok;
+classify_reject(unexpectedly_healthy) ->
+    {error, connection_not_refused_under_enforce}.
 
 %%====================================================================
 %% Fault injection — a service must survive its far station failing
