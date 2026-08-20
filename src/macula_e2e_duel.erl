@@ -1239,7 +1239,7 @@ on_isolation_fed({ok, Mcid}, A, B, Realm, Bytes) ->
 
 on_isolation_resolved({error, Reason}, _A, _B, _Realm, _Mcid, _Bytes) ->
     {error, {content_not_resolved, Reason}};
-on_isolation_resolved(#{endpoint := Url, announcer_node := Node},
+on_isolation_resolved({ok, #{endpoint := Url, announcer_node := Node}},
                       A, B, Realm, Mcid, Bytes) ->
     Self = self(),
     TrustOpts = #{expected_node_id => Node, pin_tls_cert => false, verify => none},
@@ -1261,8 +1261,14 @@ on_isolation_resolved(#{endpoint := Url, announcer_node := Node},
 
 timed_isolation_rpc(PoolB, Realm, Procedure, Url, TrustOpts, I) ->
     Started = erlang:monotonic_time(millisecond),
+    %% macula:call_station/7's last arg is ONE opts map carrying both the
+    %% UCAN token (under ucan_token, absent here) and the trust overrides
+    %% -- there is no public /8 that takes them as separate positional
+    %% args (that split happens internally, in macula_client). This call
+    %% was never exercised until the DHT-walk fix made the resolve step
+    %% upstream of it succeed for the first time, so the undef survived.
     Reply = macula:call_station(PoolB, Url, Realm, Procedure, #{<<"i">> => I},
-                                ?CALL_TIMEOUT_MS, <<>>, TrustOpts),
+                                ?CALL_TIMEOUT_MS, TrustOpts),
     Elapsed = erlang:monotonic_time(millisecond) - Started,
     {I, Elapsed, Reply}.
 
