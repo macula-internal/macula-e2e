@@ -22,6 +22,19 @@ below).
 | `dht_put_find` | put_record + find_record round-trip on a fresh-identity node_record |
 | `weather_subscribe` | Live `_mesh.weather` ≥ 1 event in 75s under realm `io.macula` |
 | `pool_close_cleanup` | `macula_event_gone` delivered on pool close |
+| `subscriber_wrapper` | `macula_subscriber` (supervised, macula 9.2.0) — subscribe + publish + receive |
+| `rpc_wrapper` | `macula_response` / `macula_request` (supervised, macula 9.2.0) — advertise + call |
+| `streaming_wrapper` | `macula_streamer` / `macula_stream_sink` (supervised, macula 9.2.0) — advertise_stream + send + chunk + close |
+| `content_wrapper` | `macula_feeder` / `macula_download` (supervised, macula 9.2.0) — put + get round-trip |
+
+The four `*_wrapper` probes exercise the same wire operations as
+`pubsub_roundtrip` / `unary_rpc` / `streaming_rpc` / `put_get_content`
+above, but driven through the supervised OTP-behaviour wrappers macula
+9.2.0 added on top of the raw `macula:*` calls, using
+`macula_e2e_wrapper_callback` as their shared behaviour callback
+module. They're client-side supervision veneers with no wire-format or
+routing change, so single-station coverage is enough — cross-station
+routing is already proven by the raw-primitive probes.
 
 Probes live in `src/macula_e2e_probe.erl` as standalone functions
 returning `ok | {error, Reason}`. The CT suite in

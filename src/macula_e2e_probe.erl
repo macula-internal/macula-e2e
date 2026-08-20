@@ -63,7 +63,11 @@
     publish_refuses_colliding_keys/4,
     pubsub_mpong_diag/4,
     cross_station_pubsub_mpong_diag/4,
-    pubsub_mpong_diag_spaced/4
+    pubsub_mpong_diag_spaced/4,
+    subscriber_wrapper/4,
+    rpc_wrapper/4,
+    streaming_wrapper/4,
+    content_wrapper/2
 ]).
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
@@ -1283,6 +1287,175 @@ drain_until_deadline_step(SubRef, Acc, Deadline, Remaining) ->
     after Remaining ->
         Acc
     end.
+
+%%====================================================================
+%% Supervised-primitive-wrapper probes (macula 9.2.0)
+%%
+%% Same four wire operations as `pubsub_roundtrip/4', `unary_rpc/4',
+%% `streaming_rpc/4', and `put_get_content/1' above, but driven
+%% through the supervised OTP-behaviour wrappers introduced in macula
+%% 9.2.0 (macula_subscriber, macula_response/macula_request,
+%% macula_streamer/macula_stream_sink, macula_feeder/macula_download)
+%% instead of the bare `macula:*' calls. These wrappers are pure
+%% client-side supervision veneers — no wire-format or routing change
+%% — so single-station coverage is enough; the cross-station routing
+%% properties are already proven by the raw-primitive probes above.
+%%
+%% All four share `macula_e2e_wrapper_callback' as their behaviour
+%% callback module, tagging every message with `e2e_wrapper' so one
+%% probe process can `receive' unambiguously.
+%%====================================================================
+
+%% @doc `macula_subscriber' wrapper — SubPool subscribes via the
+%% supervised behaviour, PubPool publishes with the raw `macula:publish/4'.
+-spec subscriber_wrapper(SubPool :: macula:pool(),
+                         PubPool :: macula:pool(),
+                         macula:realm(),
+                         macula:topic()) -> result().
+subscriber_wrapper(SubPool, PubPool, Realm, Topic) ->
+    {ok, Pid} = macula_subscriber:start_link(macula_e2e_wrapper_callback,
+                                             SubPool, Realm, Topic, self()),
+    timer:sleep(?SUBSCRIBE_SETTLE_MS),
+    Token = crypto:strong_rand_bytes(16),
+    Payload = #{<<"token">> => Token},
+    ok = macula:publish(PubPool, Realm, Topic, Payload),
+    Result = await_wrapper_sub_event(Topic, Payload, 5_000),
+    catch gen_server:stop(Pid),
+    Result.
+
+await_wrapper_sub_event(Topic, ExpectedPayload, TimeoutMs) ->
+    Expected1 = normalise_keys(ExpectedPayload),
+    receive
+        {e2e_wrapper, sub_event, Topic, Got, _Meta} ->
+            event_match_result(normalise_keys(Got) =:= Expected1, ExpectedPayload, Got)
+    after TimeoutMs ->
+        {error, {no_event, Topic, expected, ExpectedPayload}}
+    end.
+
+%% @doc `macula_response' / `macula_request' wrapper — ServerPool
+%% advertises via the supervised responder, CallerPool calls via the
+%% supervised requester. Handler echoes the payload under `echo',
+%% mirroring `unary_rpc/4''s own handler.
+-spec rpc_wrapper(ServerPool :: macula:pool(),
+                  CallerPool :: macula:pool(),
+                  macula:realm(),
+                  macula:procedure()) -> result().
+rpc_wrapper(ServerPool, CallerPool, Realm, Procedure) ->
+    {ok, Sup} = macula_response:advertise(ServerPool, Realm, Procedure,
+                                          macula_e2e_wrapper_callback, self()),
+    timer:sleep(?ADVERTISE_SETTLE_MS),
+    Args = #{<<"x">> => 42},
+    {ok, ReqPid} = macula_request:start_link(macula_e2e_wrapper_callback,
+                                             CallerPool, Realm, Procedure,
+                                             Args, 5_000, self()),
+    Result = await_wrapper_reply(Args, 8_000),
+    catch gen_server:stop(ReqPid),
+    catch macula_response:unadvertise(ServerPool, Realm, Procedure),
+    %% Sup is linked to this process (macula_response:advertise/5 starts
+    %% it via supervisor:start_link/2). unlink/1 first -- exit/2 with a
+    %% non-normal reason on a still-linked pid races back and can kill
+    %% the caller before it returns Result.
+    unlink(Sup),
+    exit(Sup, shutdown),
+    Result.
+
+await_wrapper_reply(Args, TimeoutMs) ->
+    receive
+        {e2e_wrapper, req_reply, Reply} -> classify_wrapper_reply(Reply, Args)
+    after TimeoutMs ->
+        {error, {no_reply, expected, Args}}
+    end.
+
+classify_wrapper_reply({ok, #{echo := Got}}, Args) ->
+    classify_unary_match(Got, Args);
+classify_wrapper_reply({ok, #{<<"echo">> := Got}}, Args) ->
+    classify_unary_match(Got, Args);
+classify_wrapper_reply({ok, Other}, Args) ->
+    {error, {unexpected_reply, Other, expected, Args}};
+classify_wrapper_reply({error, _} = E, _) ->
+    E.
+
+%% @doc `macula_streamer' / `macula_stream_sink' wrapper — ServerPool
+%% advertises a supervised streaming provider, CallerPool opens a
+%% supervised sink. One chunk out, then close, draining both signals
+%% on the consumer side.
+-spec streaming_wrapper(ServerPool :: macula:pool(),
+                        CallerPool :: macula:pool(),
+                        macula:realm(),
+                        macula:procedure()) -> result().
+streaming_wrapper(ServerPool, CallerPool, Realm, Procedure) ->
+    {ok, StreamerSup} = macula_streamer:advertise(ServerPool, Realm, Procedure,
+                                                  macula_e2e_wrapper_callback, self()),
+    timer:sleep(?ADVERTISE_SETTLE_MS),
+    {ok, SinkPid} = macula_stream_sink:start_link(macula_e2e_wrapper_callback,
+                                                  CallerPool, Realm, Procedure, self()),
+    Result = wrapper_stream_exchange(),
+    catch gen_server:stop(SinkPid),
+    catch macula_streamer:unadvertise(ServerPool, Realm, Procedure),
+    %% Same link hazard as rpc_wrapper/4 above -- unlink before exit/2.
+    unlink(StreamerSup),
+    exit(StreamerSup, shutdown),
+    Result.
+
+wrapper_stream_exchange() ->
+    receive
+        {e2e_wrapper, stream_opened, _Args, StreamerPid} ->
+            wrapper_stream_send(StreamerPid)
+    after 10_000 ->
+        {error, no_stream_opened}
+    end.
+
+wrapper_stream_send(StreamerPid) ->
+    ok = macula_streamer:send(StreamerPid, <<"e2e-wrapper-chunk">>),
+    wrapper_stream_close(StreamerPid, wrapper_await_chunk()).
+
+wrapper_await_chunk() ->
+    receive
+        {e2e_wrapper, sink_chunk, <<"e2e-wrapper-chunk">>} -> ok;
+        {e2e_wrapper, sink_chunk, Other} -> {error, {unexpected_chunk, Other}}
+    after 8_000 -> {error, chunk_timeout}
+    end.
+
+wrapper_stream_close(StreamerPid, ok) ->
+    ok = macula_streamer:close(StreamerPid),
+    receive
+        {e2e_wrapper, sink_closed, _Reason} -> ok
+    after 8_000 -> {error, close_timeout}
+    end;
+wrapper_stream_close(_StreamerPid, Error) ->
+    Error.
+
+%% @doc `macula_feeder' / `macula_download' wrapper — feed random
+%% bytes via the supervised feeder, download them back via the
+%% supervised downloader, assert byte-for-byte match. Single-pool,
+%% mirroring `put_get_content/1'.
+-spec content_wrapper(macula:pool(), macula:realm()) -> result().
+content_wrapper(Pool, Realm) ->
+    Bytes = crypto:strong_rand_bytes(8192),
+    {ok, FeederPid} = macula_feeder:start_link(macula_e2e_wrapper_callback,
+                                               Pool, Realm, Bytes, self()),
+    FedResult = receive
+        {e2e_wrapper, fed, {ok, Mcid}} -> {ok, Mcid};
+        {e2e_wrapper, fed, Other} -> {error, {feed_failed, Other}}
+    after 15_000 -> {error, feed_timeout}
+    end,
+    catch gen_server:stop(FeederPid),
+    wrapper_content_download(Pool, Realm, Bytes, FedResult).
+
+wrapper_content_download(_Pool, _Realm, _Bytes, {error, _} = Error) ->
+    Error;
+wrapper_content_download(Pool, Realm, Bytes, {ok, Mcid}) ->
+    {ok, DownloaderPid} = macula_download:start_link(macula_e2e_wrapper_callback,
+                                                      Pool, Realm, Mcid, self()),
+    Result = receive
+        {e2e_wrapper, downloaded, {ok, Bytes}} -> ok;
+        {e2e_wrapper, downloaded, {ok, Other}} ->
+            {error, {content_mismatch, byte_size(Bytes), byte_size(Other)}};
+        {e2e_wrapper, downloaded, Other} -> {error, {download_failed, Other}}
+    after 15_000 -> {error, download_timeout}
+    end,
+    catch gen_server:stop(DownloaderPid),
+    Result.
 
 %%====================================================================
 %% Helpers

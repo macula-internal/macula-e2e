@@ -70,7 +70,11 @@
     publish_refuses_colliding_keys/1,
     pubsub_mpong_diag/1,
     cross_station_pubsub_mpong_diag/1,
-    pubsub_mpong_diag_spaced/1
+    pubsub_mpong_diag_spaced/1,
+    subscriber_wrapper/1,
+    rpc_wrapper/1,
+    streaming_wrapper/1,
+    content_wrapper/1
 ]).
 
 -define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
@@ -154,7 +158,17 @@ all() ->
      %% died after suspect" failure modes.
      pubsub_mpong_diag,
      cross_station_pubsub_mpong_diag,
-     pubsub_mpong_diag_spaced].
+     pubsub_mpong_diag_spaced,
+     %% Supervised-primitive-wrapper probes (macula 9.2.0): same four
+     %% wire operations as the raw-primitive probes above, driven
+     %% through macula_subscriber / macula_response+macula_request /
+     %% macula_streamer+macula_stream_sink / macula_feeder+macula_download
+     %% instead of bare macula:* calls. Single-station — see
+     %% macula_e2e_probe's moduledoc note on why no cross-station variant.
+     subscriber_wrapper,
+     rpc_wrapper,
+     streaming_wrapper,
+     content_wrapper].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(sasl),
@@ -298,6 +312,36 @@ pool_close_cleanup(Config) ->
 put_get_content(Config) ->
     Pool = ?config(pool, Config),
     expect_ok(macula_e2e_probe:put_get_content(Pool)).
+
+%%--------------------------------------------------------------------
+%% Supervised-primitive-wrapper probes (macula 9.2.0)
+%%--------------------------------------------------------------------
+
+subscriber_wrapper(Config) ->
+    Sub = ?config(pool, Config),
+    Pub = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Topic = unique_topic(<<"e2e.wrapper.sub">>),
+    expect_ok(macula_e2e_probe:subscriber_wrapper(Sub, Pub, Realm, Topic)).
+
+rpc_wrapper(Config) ->
+    Server = ?config(pool, Config),
+    Caller = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Procedure = unique_topic(<<"e2e.wrapper.rpc">>),
+    expect_ok(macula_e2e_probe:rpc_wrapper(Server, Caller, Realm, Procedure)).
+
+streaming_wrapper(Config) ->
+    Server = ?config(pool, Config),
+    Caller = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Procedure = unique_topic(<<"e2e.wrapper.stream">>),
+    expect_ok(macula_e2e_probe:streaming_wrapper(Server, Caller, Realm, Procedure)).
+
+content_wrapper(Config) ->
+    Pool = ?config(pool, Config),
+    Realm = ?config(test_realm, Config),
+    expect_ok(macula_e2e_probe:content_wrapper(Pool, Realm)).
 
 %%--------------------------------------------------------------------
 %% Cross-station hop probes — exercise daemon→station→station→daemon.
