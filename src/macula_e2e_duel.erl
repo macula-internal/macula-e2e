@@ -832,7 +832,8 @@ classify_absent_record({ok, Record}) ->
 fresh_record(Realm) ->
     Identity = macula_identity:generate(),
     NodeId   = macula_identity:public(Identity),
-    Record   = macula_record:node_record(NodeId, [Realm], 0),
+    Record   = macula_record:node_record(NodeId, [Realm], 0,
+                                         #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
     {Signed, macula_record:storage_key(Signed)}.
 

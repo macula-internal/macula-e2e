@@ -227,7 +227,8 @@ on_recv({error, _} = E, _Stream, _Acc)    -> E.
 dht_put_find(Pool, Realm) ->
     Identity = macula_identity:generate(),
     NodeId = macula_identity:public(Identity),
-    Record = macula_record:node_record(NodeId, [Realm], 0),
+    Record = macula_record:node_record(NodeId, [Realm], 0,
+                                       #{kind => <<"test_daemon">>}),
     Signed = macula_record:sign(Record, Identity),
     Key = macula_record:storage_key(Signed),
     classify_put_find(macula:put_record(Pool, Signed), Pool, Key).
@@ -582,7 +583,8 @@ do_many_concurrent_dht_records(NumRecords, WriterPool, ReaderPool, Realm) ->
     Records = [begin
         Identity = macula_identity:generate(),
         NodeId   = macula_identity:public(Identity),
-        Record   = macula_record:node_record(NodeId, [Realm], 0),
+        Record   = macula_record:node_record(NodeId, [Realm], 0,
+                                             #{kind => <<"test_daemon">>}),
         Signed   = macula_record:sign(Record, Identity),
         {macula_record:storage_key(Signed), Signed}
     end || _ <- lists:seq(1, NumRecords)],
@@ -750,7 +752,8 @@ cross_station_tombstone_propagation(WriterPool, ReaderPool, Realm) ->
 do_tombstone_propagation(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
     Identity = macula_identity:generate(),
     NodeId   = macula_identity:public(Identity),
-    Record   = macula_record:node_record(NodeId, [Realm], 0),
+    Record   = macula_record:node_record(NodeId, [Realm], 0,
+                                         #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
     Key      = macula_record:storage_key(Signed),
     tombstone_after_put(macula:put_record(WriterPool, Signed),
@@ -869,7 +872,8 @@ subscribe_records_subscribed({ok, SubRef}, WriterPool, ReaderPool,
     timer:sleep(?SUBSCRIBE_SETTLE_MS),
     Identity = macula_identity:generate(),
     NodeId   = macula_identity:public(Identity),
-    Record   = macula_record:node_record(NodeId, [Realm], 0),
+    Record   = macula_record:node_record(NodeId, [Realm], 0,
+                                         #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
     Key      = macula_record:storage_key(Signed),
     PutAt    = erlang:monotonic_time(millisecond),
@@ -907,7 +911,8 @@ await_record_callback(Tag, ExpectedKey, PutAt, TimeoutMs) ->
 cross_station_dht_put_find(WriterPool, ReaderPool, Realm) ->
     Identity = macula_identity:generate(),
     NodeId = macula_identity:public(Identity),
-    Record = macula_record:node_record(NodeId, [Realm], 0),
+    Record = macula_record:node_record(NodeId, [Realm], 0,
+                                       #{kind => <<"test_daemon">>}),
     Signed = macula_record:sign(Record, Identity),
     Key = macula_record:storage_key(Signed),
     classify_put_find(macula:put_record(WriterPool, Signed),
