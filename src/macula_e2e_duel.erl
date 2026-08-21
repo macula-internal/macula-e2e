@@ -1381,25 +1381,44 @@ puzzle_reject_on_enforce(_A, B) ->
         catch macula_e2e_fault:set_puzzle_mode(Station, off)
     end.
 
+%% `macula:status/1''s `healthy_links' is the WRONG signal here --
+%% verified live 2026-08-21 against stockholm. It reflects the
+%% CLIENT's own wire-level CONNECT/HELLO completion, which finishes
+%% (and stays reported "healthy") entirely independent of the
+%% server's puzzle decision, made one layer up in
+%% `macula_station_listener:on_handshake_complete/3' AFTER the wire
+%% handshake the client is measuring. A rejected identity never gets
+%% promoted into that listener's `connected'/`peers' state (confirmed
+%% live via `sys:get_state/1'), so its frames are never routed by
+%% `peer_observer' -- but the client-side link worker has no way to
+%% observe that and reports itself healthy regardless, including
+%% through however many silent reject-reconnect cycles follow. A real
+%% call is the only signal that actually distinguishes "accepted" from
+%% "rejected": `find_record/2' against a system-served DHT procedure
+%% every station answers natively returns `{error, not_found}' PROMPTLY
+%% for an accepted peer (confirmed via every other round exercising it
+%% all day) and times out for a peer whose frames are being silently
+%% dropped (confirmed manually against stockholm under enforce: the
+%% identical shape, a `{error, timeout}' where an accepted connection
+%% gets a fast explicit answer).
 attempt_non_puzzle_connect(Station) ->
     Seed = macula_e2e_fleet:seed_url(Station),
     Identity = macula_identity:generate(),  %% deliberately NOT puzzle-hardened
     {ok, Pool} = macula:connect([Seed], #{identity => Identity}),
-    Result = classify_reject(wait_reject_settled(Pool, 15_000)),
+    timer:sleep(?SETTLE_MS),
+    Probe = macula:find_record(Pool, crypto:strong_rand_bytes(32)),
+    Result = classify_reject(Probe),
     catch macula:close(Pool),
     Result.
 
-wait_reject_settled(_Pool, Left) when Left =< 0 ->
-    never_healthy;
-wait_reject_settled(Pool, Left) ->
-    case macula:status(Pool) of
-        {ok, #{healthy_links := N}} when N > 0 -> unexpectedly_healthy;
-        _ -> timer:sleep(500), wait_reject_settled(Pool, Left - 500)
-    end.
-
-classify_reject(never_healthy)        -> ok;
-classify_reject(unexpectedly_healthy) ->
-    {error, connection_not_refused_under_enforce}.
+classify_reject({error, timeout}) ->
+    ok;
+classify_reject({error, not_found}) ->
+    {error, connection_not_refused_under_enforce};
+classify_reject({ok, _} = Ok) ->
+    {error, {connection_not_refused_under_enforce, Ok}};
+classify_reject(Other) ->
+    {error, {unexpected_reject_probe_result, Other}}.
 
 %%====================================================================
 %% Fault injection — a service must survive its far station failing
