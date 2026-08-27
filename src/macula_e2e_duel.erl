@@ -1378,8 +1378,29 @@ puzzle_reject_on_enforce(_A, B) ->
     try
         attempt_non_puzzle_connect(Station)
     after
-        catch macula_e2e_fault:set_puzzle_mode(Station, off)
+        %% Not a bare `catch' — a live station left stuck in `enforce'
+        %% (it can reject its OWN fleet peers) must never fail silently
+        %% just because the revert call itself had a transient hiccup.
+        %% Confirmed live 2026-08-27: this round failed, the bare
+        %% `catch' swallowed a revert failure with zero indication in
+        %% the report, and stockholm sat in `enforce' until a manual
+        %% check caught it.
+        ensure_puzzle_off(Station)
     end.
+
+ensure_puzzle_off(Station) ->
+    report_puzzle_revert(Station,
+                         (catch macula_e2e_fault:set_puzzle_mode(Station, off))).
+
+report_puzzle_revert(_Station, ok) ->
+    ok;
+report_puzzle_revert(Station, Reason) ->
+    io:format(
+      "~n!! FAILED to revert ~s puzzle_enforcement to 'off': ~p~n"
+      "!! Station may still be in ENFORCE mode -- check manually:~n"
+      "!!   station-eval.sh <ssh-target> <container> "
+      "'application:get_env(macula_station, puzzle_enforcement, off).'~n~n",
+      [Station, Reason]).
 
 %% `macula:status/1''s `healthy_links' is the WRONG signal here --
 %% verified live 2026-08-21 against stockholm. It reflects the
@@ -1412,6 +1433,18 @@ attempt_non_puzzle_connect(Station) ->
     Result.
 
 classify_reject({error, timeout}) ->
+    ok;
+%% macula 10.9.0 switched puzzle-invalid rejection from
+%% `macula_peering:close/2' (a 5s graceful drain the pool would sit
+%% through, surfacing here as `find_record' eventually timing out —
+%% this round's ORIGINAL and only-documented accepted shape) to
+%% `macula_peering:reject/2' (immediate termination, no drain — see
+%% macula CHANGELOG [10.9.0]). Confirmed live 2026-08-27: the pool now
+%% never forms a healthy link at all, so `find_record' fails fast with
+%% `no_healthy_station' instead of hanging into a timeout. Both are the
+%% station correctly refusing the connection; the immediate shape is
+%% the intended, better outcome of that fix, not a new defect.
+classify_reject({error, no_healthy_station}) ->
     ok;
 classify_reject({error, not_found}) ->
     {error, connection_not_refused_under_enforce};
