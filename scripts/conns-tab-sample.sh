@@ -1,33 +1,25 @@
 #!/usr/bin/env bash
-# Quick-sample conns_tab size on every station in the Leuven mesh.
-# Usage: conns_tab_sample.sh [label]
+# Quick-sample conns_tab size on every real fleet station.
+# Usage: conns-tab-sample.sh [label]
 # Prints: <unix_ts> <label> <station>=<conns_tab_size>...
 
 set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
 LABEL="${1:-snapshot}"
-STATIONS=(
-  "stations-hetzner-falkenstein.macula.io|macula-station-brussels|centrum"
-  "stations-hetzner-falkenstein.macula.io|macula-station-ghent|gasthuisberg"
-  "stations-hetzner-falkenstein.macula.io|macula-station-bertem|bertem"
-  "relays-hetzner-helsinki.macula.io|macula-station-antwerp|haasrode"
-  "relays-hetzner-helsinki.macula.io|macula-station-leuven|kessel-lo"
-  "relays-hetzner-helsinki.macula.io|macula-station-linden|linden"
-  "relays-hetzner-nuremberg.macula.io|macula-station-bruges|bruges"
-  "relays-hetzner-nuremberg.macula.io|macula-station-hasselt|hasselt"
-  "relays-hetzner-nuremberg.macula.io|macula-station-wijgmaal|wijgmaal"
-)
 
 EVAL='try ets:info(macula_station_peer_observer_conns, size) catch _:_ -> undefined end.'
 
 ts="$(date +%s)"
 printf "%s %s" "$ts" "$LABEL"
-for spec in "${STATIONS[@]}"; do
-  host="${spec%%|*}"
-  rest="${spec#*|}"
-  cont="${rest%%|*}"
-  name="${rest#*|}"
-  size=$(ssh -i ~/.ssh/id_hetzner -o BatchMode=yes -o ConnectTimeout=10 \
-    root@"$host" "docker exec $cont /opt/macula_station/bin/macula_station eval '$EVAL'" 2>/dev/null \
+# Read the whole table into an array first, not `while read < <(...)':
+# `ssh' inside that loop reads its own stdin from the same fd the loop
+# is consuming, so it silently eats the rest of the table after the
+# first iteration.
+mapfile -t FLEET_ROWS < <("${HERE}/fleet-table.sh")
+for row in "${FLEET_ROWS[@]}"; do
+  IFS='|' read -r ssh_host ssh_key cont name <<< "$row"
+  size=$(ssh -i ~/.ssh/"$ssh_key" -o BatchMode=yes -o ConnectTimeout=10 \
+    root@"$ssh_host" "docker exec $cont /opt/macula_station/bin/macula_station eval '$EVAL'" 2>/dev/null \
     | tr -d ' \n\t\r')
   printf " %s=%s" "$name" "$size"
 done

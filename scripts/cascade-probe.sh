@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Run N e2e iterations against the Leuven fleet, sampling
-# `conns_tab` + macula_dht state on every station between iterations.
-# Surfaces accumulation per iteration so the cascade pattern is
-# visible without parsing CT output.
+# Run N e2e iterations against the real fleet's two-hop pair
+# (station-fi-helsinki <-> station-de-nuremberg, the one core pair
+# with no direct edge — see macula_e2e_fleet:two_hop_pair/0),
+# sampling `conns_tab' on every station between iterations. Surfaces
+# accumulation per iteration so the cascade pattern is visible
+# without parsing CT output.
 #
-# Complementary to `torture-mesh.sh` (which records pass/fail counts
+# Complementary to `torture-mesh.sh' (which records pass/fail counts
 # in a CSV and detects cascade timing). This script focuses on the
 # substrate-state samples between runs.
 #
@@ -25,8 +27,8 @@ cd "${HERE}/.."
 for i in $(seq 1 "$N"); do
   echo "=== iteration $i ===" | tee -a "$LOG"
   start=$(date +%s)
-  MACULA_E2E_BOOTSTRAP="https://station-be-leuven-centrum.macula.io:4433" \
-  MACULA_E2E_BOOTSTRAP_OTHER="https://station-be-leuven-haasrode.macula.io:4433" \
+  MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433" \
+  MACULA_E2E_BOOTSTRAP_OTHER="https://station-de-nuremberg.macula.io:4433" \
   timeout 540 rebar3 ct --suite test/macula_e2e_SUITE 2>&1 \
     | grep -E "Failed|Passed|Skipped" \
     | tail -1 \

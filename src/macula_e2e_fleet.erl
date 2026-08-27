@@ -38,7 +38,7 @@
 
 -export([stations/0, names/0, domain/0, port/0,
          seed_url/1, core/0, leaves/0, two_hop_pair/0,
-         ssh_target/1]).
+         ssh_target/1, print_ssh_table/0]).
 
 -export_type([station/0, ssh_target/0]).
 
@@ -117,6 +117,26 @@ ssh_target("station-se-stockholm") ->
     {"172.234.124.60", "id_ed25519"};
 ssh_target(Other) ->
     error({no_ssh_target, Other}).
+
+%% @doc Print one `SshHost|SshKey|Container|NickName' line per
+%% configured station to stdout.
+%%
+%% The single source of truth for bash scripts that need the fleet
+%% list. `torture-mesh.sh', `cascade-probe.sh' and
+%% `conns-tab-sample.sh' used to each carry their own hand-copied
+%% station array and all three drifted onto the retired Leuven
+%% topology (see this module's own moduledoc) — the exact failure
+%% mode a single generator closes off for good. Consumed via:
+%%
+%%   erl -pa .../ebin -noshell -run macula_e2e_fleet print_ssh_table
+-spec print_ssh_table() -> no_return().
+print_ssh_table() ->
+    lists:foreach(fun print_ssh_row/1, stations()),
+    halt(0).
+
+print_ssh_row({_DialHost, Container, Nick}) ->
+    {SshHost, SshKey} = ssh_target(Nick),
+    io:format("~s|~s|~s|~s~n", [SshHost, SshKey, Container, Nick]).
 
 %% @doc The five core stations. Each dials three of the other four.
 -spec core() -> [string()].

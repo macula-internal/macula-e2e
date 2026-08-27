@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Stress-run the e2e suite against the Leuven cross-station topology.
+# Stress-run the e2e suite against the real fleet's two-hop pair
+# (station-fi-helsinki <-> station-de-nuremberg — see
+# macula_e2e_fleet:two_hop_pair/0).
 # Two modes:
 #   - rounds mode (default): run N suite iterations back-to-back
 #   - soak mode (--duration M): loop suite iterations until M minutes elapsed
@@ -69,31 +71,29 @@ STAMP="$(date +%s)"
 LOG="/tmp/torture-mesh-${STAMP}.log"
 CSV="${CSV:-/tmp/torture-mesh-${STAMP}.csv}"
 
-readonly STATIONS=(
-  "stations-hetzner-falkenstein.macula.io|macula-station-brussels|centrum"
-  "stations-hetzner-falkenstein.macula.io|macula-station-ghent|gasthuisberg"
-  "stations-hetzner-falkenstein.macula.io|macula-station-bertem|bertem"
-  "relays-hetzner-helsinki.macula.io|macula-station-antwerp|haasrode"
-  "relays-hetzner-helsinki.macula.io|macula-station-leuven|kessel-lo"
-  "relays-hetzner-helsinki.macula.io|macula-station-linden|linden"
-  "relays-hetzner-nuremberg.macula.io|macula-station-bruges|bruges"
-  "relays-hetzner-nuremberg.macula.io|macula-station-hasselt|hasselt"
-  "relays-hetzner-nuremberg.macula.io|macula-station-wijgmaal|wijgmaal"
-)
+readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PROBE='POPid=whereis(macula_station_peer_observer),{message_queue_len,Q}=process_info(POPid,message_queue_len),{memory,M}=process_info(POPid,memory),Reg=whereis(macula_remote_advertise_registry),L=length(macula_remote_advertise_registry:list(Reg)),{mbox,Q,mem_kb,M div 1024,reg,L}.'
 
+# Station list + per-station ssh host/key come from
+# `macula_e2e_fleet:print_ssh_table/0' via `fleet-table.sh' — the
+# single source of truth, not a hand-copied array. Hardcoding a
+# fourth copy here is exactly how this script drifted onto the
+# retired Leuven topology after it was decommissioned 2026-07-27.
 snapshot() {
   local label="$1"
   echo "=== ${label} ===" | tee -a "${LOG}"
-  for spec in "${STATIONS[@]}"; do
-    local host="${spec%%|*}"
-    local rest="${spec#*|}"
-    local cont="${rest%%|*}"
-    local name="${rest#*|}"
-    printf "%-15s " "${name}" | tee -a "${LOG}"
-    ssh -i ~/.ssh/id_hetzner -o BatchMode=yes -o ConnectTimeout=10 \
-        "root@${host}" \
+  # Array, not `while read < <(...)': `ssh' inside that loop reads its
+  # own stdin from the same fd the loop consumes, silently eating the
+  # rest of the table after the first station.
+  local -a fleet_rows
+  mapfile -t fleet_rows < <("${HERE}/fleet-table.sh")
+  local row ssh_host ssh_key cont name
+  for row in "${fleet_rows[@]}"; do
+    IFS='|' read -r ssh_host ssh_key cont name <<< "${row}"
+    printf "%-25s " "${name}" | tee -a "${LOG}"
+    ssh -i ~/.ssh/"${ssh_key}" -o BatchMode=yes -o ConnectTimeout=10 \
+        "root@${ssh_host}" \
         "docker exec ${cont} /opt/macula_station/bin/macula_station eval '${PROBE}'" \
       2>&1 | tail -1 | tee -a "${LOG}"
   done
@@ -112,8 +112,8 @@ run_iteration() {
   echo "=== iter ${n} @ $(date +%H:%M:%S) ===" | tee -a "${LOG}"
 
   cd "$(dirname "$0")/.."
-  MACULA_E2E_BOOTSTRAP="https://station-be-leuven-centrum.macula.io:4433" \
-  MACULA_E2E_BOOTSTRAP_OTHER="https://station-be-leuven-haasrode.macula.io:4433" \
+  MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433" \
+  MACULA_E2E_BOOTSTRAP_OTHER="https://station-de-nuremberg.macula.io:4433" \
   timeout 540 rebar3 ct --suite test/macula_e2e_SUITE > "${out_file}" 2>&1
   local exit_code=$?
 
