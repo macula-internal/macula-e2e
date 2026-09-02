@@ -109,7 +109,7 @@ is the lever — every phase reuses it.
   by GH Actions on every push to `main`.
 - Scheduled via systemd timer / cron / docker-compose-with-restart on
   one or more lab nodes; per-node deployment lives in
-  [`macula-internal/macula-demo/infrastructure/<box>/`](https://codeberg.org/macula-internal/macula-demo).
+  [`macula-internal/macula-demo/infrastructure/<box>/`](https://github.com/macula-io/macula-demo).
 - Failures surface in journald per container run.
 
 ### Phase 1 — long-running probe daemon

@@ -10,5 +10,5 @@
     {modules, []},
     {registered, []},
     {licenses, ["Apache-2.0"]},
-    {links, [{"Codeberg", "https://codeberg.org/macula-internal/macula-e2e"}]}
+    {links, [{"GitHub", "https://github.com/macula-internal/macula-e2e"}]}
 ]}.
