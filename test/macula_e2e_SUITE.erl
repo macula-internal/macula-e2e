@@ -34,11 +34,13 @@
     dht_put_find/1,
     pool_close_cleanup/1,
     put_get_content/1,
+    put_get_chunked_content/1,
     cross_station_pubsub/1,
     cross_station_unary_rpc/1,
     cross_station_streaming_rpc/1,
     cross_station_dht_put_find/1,
     cross_station_put_content/1,
+    cross_station_put_chunked_content/1,
     multi_publisher_pubsub/1,
     cross_station_multi_publisher_pubsub/1,
     many_concurrent_calls/1,
@@ -96,6 +98,7 @@ all() ->
      streaming_rpc,
      dht_put_find,
      put_get_content,
+     put_get_chunked_content,
      pool_close_cleanup,
      %% Cross-station hop probes — only run when MACULA_E2E_BOOTSTRAP_OTHER
      %% is set. Each tc skips cleanly when the second pool isn't wired.
@@ -104,6 +107,7 @@ all() ->
      cross_station_streaming_rpc,
      cross_station_dht_put_find,
      cross_station_put_content,
+     cross_station_put_chunked_content,
      multi_publisher_pubsub,
      cross_station_multi_publisher_pubsub,
      many_concurrent_calls,
@@ -324,6 +328,10 @@ put_get_content(Config) ->
     Pool = ?config(pool, Config),
     expect_ok(macula_e2e_probe:put_get_content(Pool)).
 
+put_get_chunked_content(Config) ->
+    Pool = ?config(pool, Config),
+    expect_ok(macula_e2e_probe:put_get_chunked_content(Pool)).
+
 %%--------------------------------------------------------------------
 %% Supervised-primitive-wrapper probes (macula 9.2.0)
 %%--------------------------------------------------------------------
@@ -394,6 +402,11 @@ cross_station_dht_put_find(Config) ->
 cross_station_put_content(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
         macula_e2e_probe:cross_station_put_content(Writer, Reader)
+    end).
+
+cross_station_put_chunked_content(Config) ->
+    cross_or_skip(Config, fun(Writer, Reader) ->
+        macula_e2e_probe:cross_station_put_chunked_content(Writer, Reader)
     end).
 
 %%--------------------------------------------------------------------

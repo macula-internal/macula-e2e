@@ -52,6 +52,8 @@
     subscribe_records_cross_station/3,
     put_get_content/1,
     cross_station_put_content/2,
+    put_get_chunked_content/1,
+    cross_station_put_chunked_content/2,
     cross_station_dht_put_find/3,
     pubsub_mpong_shape/4,
     cross_station_pubsub_mpong_shape/4,
@@ -70,13 +72,16 @@
 ]).
 
 -ifdef(TEST).
--export([drain_pubsub_tokens/3]).
+-export([drain_pubsub_tokens/3, chunked_mcid/1]).
 -endif.
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
 %% How long the multi-publisher probe waits for its senders after the
 %% drain: one publish call's own timeout (5 s + 500 ms) plus slack.
 -define(SENDER_WAIT_MS,       6_000).
+%% Three full chunks and a partial one at macula_manifest's default chunk
+%% size (262144 bytes), so put_content takes the manifest path.
+-define(CHUNKED_CONTENT_BYTES, 3 * 262_144 + 1_000).
 %% Bumped 1500 -> 3000 on 2026-05-13. The macula-station 4.x ADVERTISE
 %% propagation path is bounded by peer_observer's gen_server mailbox
 %% dispatch latency, which under live-fleet DHT load (~85% of inbound
@@ -303,6 +308,42 @@ classify_get_content({ok, Bytes}, Bytes) -> ok;
 classify_get_content({ok, Other},  Bytes) ->
     {error, {content_mismatch, byte_size(Bytes), byte_size(Other)}};
 classify_get_content({error, _} = E, _Bytes) -> E.
+
+%% @doc Chunked content put/get round-trip on one pool. The blob is larger
+%% than macula_manifest's default chunk size, so the put mints a manifest
+%% MCID (codec `16#56') and the get fetches the manifest, then every chunk,
+%% and verifies the whole. Every other content probe puts 8 KiB, which is
+%% always one block and never takes that path.
+-spec put_get_chunked_content(macula:pool()) -> result().
+put_get_chunked_content(Pool) ->
+    do_put_get_chunked_content(Pool, Pool).
+
+%% @doc Cross-station variant: Writer puts on one station, Reader fetches
+%% the manifest and its chunks through a different one.
+-spec cross_station_put_chunked_content(macula:pool(), macula:pool()) ->
+    result().
+cross_station_put_chunked_content(WriterPool, ReaderPool) ->
+    do_put_get_chunked_content(WriterPool, ReaderPool).
+
+do_put_get_chunked_content(WriterPool, ReaderPool) ->
+    Bytes = crypto:strong_rand_bytes(?CHUNKED_CONTENT_BYTES),
+    classify_chunked_put(macula:put_content(WriterPool, Bytes),
+                         ReaderPool, Bytes).
+
+classify_chunked_put({ok, MCID}, ReaderPool, Bytes) ->
+    fetch_chunked_content(chunked_mcid(MCID), ReaderPool, Bytes);
+classify_chunked_put({error, _} = E, _ReaderPool, _Bytes) ->
+    E.
+
+%% A put that took the manifest path names a manifest MCID. A single-block
+%% MCID (codec `16#55') means the chunked path never ran.
+chunked_mcid(<<1, 16#56, _/binary>> = MCID) -> {ok, MCID};
+chunked_mcid(MCID)                          -> {error, {not_chunked, MCID}}.
+
+fetch_chunked_content({ok, MCID}, ReaderPool, Bytes) ->
+    classify_get_content(macula:get_content(ReaderPool, MCID), Bytes);
+fetch_chunked_content({error, _} = E, _ReaderPool, _Bytes) ->
+    E.
 
 %% @doc Cross-station pub/sub roundtrip. PubPool is dialled into one
 %% bootstrap station; SubPool into a DIFFERENT bootstrap station. The
