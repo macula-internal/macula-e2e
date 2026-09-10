@@ -1,17 +1,17 @@
 %%%-------------------------------------------------------------------
 %%% @doc Common Test wrapper around `macula_e2e_probe'.
 %%%
-%%% Bootstrap URL is configurable via the `MACULA_E2E_BOOTSTRAP'
-%%% env var (comma-separated). Defaults to
-%%% `https://boot.macula.io:4433'.
+%%% Seeds come from the `MACULA_E2E_BOOTSTRAP' env var (comma-separated
+%%% URLs), which is required. There is no default seed.
 %%%
-%%% The suite skips cleanly when no bootstrap is reachable —
-%%% offline runs do not fail the build.
+%%% The suite FAILS when the variable is unset or no seed yields a
+%%% healthy link. It used to skip, which exits 0, so an unreachable or
+%%% refusing fleet read as a green run.
 %%%
-%%%   rebar3 ct --suite test/macula_e2e_SUITE
-%%%   ./scripts/run-once.sh
+%%%   MACULA_E2E_BOOTSTRAP=https://station-fi-helsinki.macula.io:4433 \
+%%%     rebar3 ct --suite test/macula_e2e_SUITE
 %%%   docker run --rm --network host \
-%%%     -e MACULA_E2E_BOOTSTRAP=https://station-be-kortrijk.macula.io:4433 \
+%%%     -e MACULA_E2E_BOOTSTRAP=https://station-fi-helsinki.macula.io:4433 \
 %%%     ghcr.io/macula-internal/macula-e2e:latest
 %%% @end
 %%%-------------------------------------------------------------------
@@ -77,7 +77,9 @@
     content_wrapper/1
 ]).
 
--define(DEFAULT_BOOTSTRAP, [<<"https://boot.macula.io:4433">>]).
+%% No default seed: the deployment supplies MACULA_E2E_BOOTSTRAP (beam00
+%% derives it from stations.csv), and init_per_suite fails without one.
+-define(DEFAULT_BOOTSTRAP, []).
 -define(WAIT_HEALTHY_MS,   30_000).
 -define(WEATHER_WAIT_MS,   75_000).
 
@@ -180,8 +182,13 @@ init_per_suite(Config) ->
     logger:set_handler_config(default, level, debug),
     logger:set_application_level(macula, debug),
     {ok, _} = application:ensure_all_started(macula),
-    Bootstrap = bootstrap_seeds(),
-    BootstrapOther = bootstrap_seeds_other(),
+    connect_fleet(bootstrap_seeds(), bootstrap_seeds_other(), Config).
+
+%% No seeds is a failure, not a skip: a daily run that silently tests
+%% nothing reads exactly like a healthy fleet.
+connect_fleet([], _BootstrapOther, _Config) ->
+    {fail, {no_bootstrap, "set MACULA_E2E_BOOTSTRAP to comma-separated seed URLs"}};
+connect_fleet(Bootstrap, BootstrapOther, Config) ->
     ct:pal("[e2e] bootstrap        = ~p", [Bootstrap]),
     ct:pal("[e2e] bootstrap_other  = ~p", [BootstrapOther]),
     {ok, Pool}  = macula:connect(Bootstrap, #{}),
@@ -223,7 +230,9 @@ on_initial_health(timeout, Pool, Other, Cross, Bootstrap, _BootstrapOther,
     macula:close(Pool),
     macula:close(Other),
     close_if_set(Cross),
-    {skip, {fleet_not_reachable, Bootstrap}}.
+    %% Fail, never skip. A skip exits 0, so a refused handshake or a dead
+    %% fleet used to read as a green run.
+    {fail, {fleet_not_reachable, Bootstrap}}.
 
 end_per_suite(Config) ->
     close_if_set(?config(pool, Config)),

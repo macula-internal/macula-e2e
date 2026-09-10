@@ -50,21 +50,17 @@ below) without touching the probe logic.
 ### Local
 
 ```bash
-rebar3 ct --suite test/macula_e2e_SUITE
-```
-
-Default bootstrap: `https://boot.macula.io:4433`. Override:
-
-```bash
-MACULA_E2E_BOOTSTRAP="https://station-be-kortrijk.macula.io:4433" \
+MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433" \
   rebar3 ct --suite test/macula_e2e_SUITE
 ```
+
+`MACULA_E2E_BOOTSTRAP` is required; there is no default seed.
 
 ### Container
 
 ```bash
 docker run --rm --network host \
-  -e MACULA_E2E_BOOTSTRAP=https://station-be-kortrijk.macula.io:4433 \
+  -e MACULA_E2E_BOOTSTRAP=https://station-fi-helsinki.macula.io:4433 \
   ghcr.io/macula-internal/macula-e2e:latest
 ```
 
@@ -73,9 +69,10 @@ QUIC-listening stations. Default Docker bridge networking masquerades
 behind the host's egress, which works most of the time but can break
 on hosts with strict NAT.
 
-The runner exits non-zero on any test failure. Suite skips cleanly
-(exit 0, all SKIPPED) when the bootstrap is unreachable — offline runs
-do not crash the schedule.
+The runner exits non-zero on any test failure. The suite fails, never
+skips, when `MACULA_E2E_BOOTSTRAP` is unset or no seed yields a healthy
+link: a skip exits 0, and an unreachable or refusing fleet must not read
+as a green run.
 
 ---
 
@@ -83,7 +80,7 @@ do not crash the schedule.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `MACULA_E2E_BOOTSTRAP` | `https://boot.macula.io:4433` | Comma-separated seed URLs. The pool spawns one peering link per seed. |
+| `MACULA_E2E_BOOTSTRAP` | none, required | Comma-separated seed URLs. The pool spawns one peering link per seed. The daily beam00 run uses every `regional` station in macula-demo's `topologies/eu/stations.csv`. |
 
 Realm tags are derived inside the suite:
 
