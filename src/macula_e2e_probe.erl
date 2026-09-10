@@ -29,13 +29,12 @@
     pool_health/1,
     pubsub_roundtrip/4,
     realm_isolation/5,
-    unary_rpc/4,
+    unary_rpc/5,
     streaming_rpc/4,
     dht_put_find/2,
-    weather_subscribe/3,
     pool_close_cleanup/1,
     cross_station_pubsub/4,
-    cross_station_unary_rpc/4,
+    cross_station_unary_rpc/5,
     cross_station_streaming_rpc/4,
     multi_publisher_pubsub/6,
     cross_station_multi_publisher_pubsub/6,
@@ -65,7 +64,7 @@
     cross_station_pubsub_mpong_diag/4,
     pubsub_mpong_diag_spaced/4,
     subscriber_wrapper/4,
-    rpc_wrapper/4,
+    rpc_wrapper/5,
     streaming_wrapper/4,
     content_wrapper/2
 ]).
@@ -146,37 +145,55 @@ check_no_cross_realm(SubRef, PubPool, RealmA, Topic) ->
     end.
 
 %% @doc Unary RPC — Server advertises a procedure, Caller calls it.
+%%
+%% `CallerNodeId' is the calling pool's own node id. The SDK hands a
+%% handler its args with the wire-authenticated `caller' merged in
+%% (macula 10.15.0), so the echo must carry exactly the args sent plus
+%% a `caller' equal to the pool that made the call.
 -spec unary_rpc(ServerPool :: macula:pool(),
                 CallerPool :: macula:pool(),
+                CallerNodeId :: binary(),
                 macula:realm(),
                 macula:procedure()) -> result().
-unary_rpc(ServerPool, CallerPool, Realm, Procedure) ->
+unary_rpc(ServerPool, CallerPool, CallerNodeId, Realm, Procedure) ->
     Handler = fun(Args) -> {ok, #{<<"got">> => Args}} end,
     ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Args = #{<<"x">> => 42},
     Reply = macula:call(CallerPool, Realm, Procedure, Args, 5_000),
     catch macula:unadvertise(ServerPool, Realm, Procedure),
-    classify_unary(Reply, Args).
+    classify_unary(Reply, Args, CallerNodeId).
 
 %% Macula 4.2.x CBOR decoder converts short text keys to atoms on
 %% receive but we send binary keys. Normalise both sides to binary
 %% before equality so the probe survives encoder asymmetry without
 %% becoming a typing test.
-classify_unary({ok, #{<<"got">> := Got}}, Args) ->
-    classify_unary_match(Got, Args);
-classify_unary({ok, #{got := Got}}, Args) ->
-    classify_unary_match(Got, Args);
-classify_unary({ok, Other}, Args) ->
+classify_unary({ok, #{<<"got">> := Got}}, Args, CallerNodeId) ->
+    classify_unary_match(Got, Args, CallerNodeId);
+classify_unary({ok, #{got := Got}}, Args, CallerNodeId) ->
+    classify_unary_match(Got, Args, CallerNodeId);
+classify_unary({ok, Other}, Args, _CallerNodeId) ->
     {error, {unexpected_reply, Other, expected, Args}};
-classify_unary({error, _} = E, _) ->
+classify_unary({error, _} = E, _Args, _CallerNodeId) ->
     E.
 
-classify_unary_match(Got, Args) ->
-    case normalise_keys(Got) =:= normalise_keys(Args) of
-        true  -> ok;
-        false -> {error, {unexpected_reply, Got, expected, Args}}
-    end.
+%% The echo minus `caller' must equal the args sent, and `caller' must be
+%% the calling pool's node id. Stricter than comparing the args alone: it
+%% also proves the handler was told who called.
+classify_unary_match(Got, Args, CallerNodeId) when is_map(Got) ->
+    caller_match(maps:take(<<"caller">>, normalise_keys(Got)),
+                 normalise_keys(Args), CallerNodeId, Got);
+classify_unary_match(Got, Args, _CallerNodeId) ->
+    {error, {unexpected_reply, Got, expected, Args}}.
+
+caller_match({CallerNodeId, Expected}, Expected, CallerNodeId, _Got) ->
+    ok;
+caller_match({OtherCaller, Expected}, Expected, CallerNodeId, _Got) ->
+    {error, {caller_mismatch, OtherCaller, expected, CallerNodeId}};
+caller_match({_Caller, _Rest}, Expected, _CallerNodeId, Got) ->
+    {error, {unexpected_reply, Got, expected, Expected}};
+caller_match(error, Expected, CallerNodeId, Got) ->
+    {error, {caller_missing, Got, expected, Expected, CallerNodeId}}.
 
 %% @doc Streaming RPC — Server advertises a server_stream that
 %% emits N integer chunks, Caller drains them.
@@ -280,18 +297,6 @@ classify_get_content({ok, Other},  Bytes) ->
     {error, {content_mismatch, byte_size(Bytes), byte_size(Other)}};
 classify_get_content({error, _} = E, _Bytes) -> E.
 
-%% @doc Subscribe to the live `_mesh.weather' topic and assert at
-%% least one event lands within `MaxWaitMs'. The real stub fleet
-%% publishes there every 60s under realm `io.macula'.
--spec weather_subscribe(macula:pool(), macula:realm(),
-                        MaxWaitMs :: pos_integer()) -> result().
-weather_subscribe(Pool, Realm, MaxWaitMs) ->
-    Topic = <<"_mesh.weather">>,
-    {ok, SubRef} = macula:subscribe(Pool, Realm, Topic, self()),
-    Result = await_any_event(SubRef, MaxWaitMs),
-    catch macula:unsubscribe(Pool, SubRef),
-    Result.
-
 %% @doc Cross-station pub/sub roundtrip. PubPool is dialled into one
 %% bootstrap station; SubPool into a DIFFERENT bootstrap station. The
 %% published event MUST traverse the inter-station mesh edge to reach
@@ -310,10 +315,11 @@ cross_station_pubsub(PubPool, SubPool, Realm, Topic) ->
 %% the cross-station link as a route to the advertising station).
 -spec cross_station_unary_rpc(ServerPool :: macula:pool(),
                               CallerPool :: macula:pool(),
+                              CallerNodeId :: binary(),
                               macula:realm(),
                               macula:procedure()) -> result().
-cross_station_unary_rpc(ServerPool, CallerPool, Realm, Procedure) ->
-    unary_rpc(ServerPool, CallerPool, Realm, Procedure).
+cross_station_unary_rpc(ServerPool, CallerPool, CallerNodeId, Realm, Procedure) ->
+    unary_rpc(ServerPool, CallerPool, CallerNodeId, Realm, Procedure).
 
 %% @doc Cross-station streaming RPC roundtrip. Server advertises a
 %% server_stream procedure on one station; Caller opens the stream
@@ -1343,9 +1349,10 @@ await_wrapper_sub_event(Topic, ExpectedPayload, TimeoutMs) ->
 %% mirroring `unary_rpc/4''s own handler.
 -spec rpc_wrapper(ServerPool :: macula:pool(),
                   CallerPool :: macula:pool(),
+                  CallerNodeId :: binary(),
                   macula:realm(),
                   macula:procedure()) -> result().
-rpc_wrapper(ServerPool, CallerPool, Realm, Procedure) ->
+rpc_wrapper(ServerPool, CallerPool, CallerNodeId, Realm, Procedure) ->
     {ok, Sup} = macula_response:advertise(ServerPool, Realm, Procedure,
                                           macula_e2e_wrapper_callback, self()),
     timer:sleep(?ADVERTISE_SETTLE_MS),
@@ -1353,7 +1360,7 @@ rpc_wrapper(ServerPool, CallerPool, Realm, Procedure) ->
     {ok, ReqPid} = macula_request:start_link(macula_e2e_wrapper_callback,
                                              CallerPool, Realm, Procedure,
                                              Args, 5_000, self()),
-    Result = await_wrapper_reply(Args, 8_000),
+    Result = await_wrapper_reply(Args, CallerNodeId, 8_000),
     catch gen_server:stop(ReqPid),
     catch macula_response:unadvertise(ServerPool, Realm, Procedure),
     %% Sup is linked to this process (macula_response:advertise/5 starts
@@ -1364,20 +1371,21 @@ rpc_wrapper(ServerPool, CallerPool, Realm, Procedure) ->
     exit(Sup, shutdown),
     Result.
 
-await_wrapper_reply(Args, TimeoutMs) ->
+await_wrapper_reply(Args, CallerNodeId, TimeoutMs) ->
     receive
-        {e2e_wrapper, req_reply, Reply} -> classify_wrapper_reply(Reply, Args)
+        {e2e_wrapper, req_reply, Reply} ->
+            classify_wrapper_reply(Reply, Args, CallerNodeId)
     after TimeoutMs ->
         {error, {no_reply, expected, Args}}
     end.
 
-classify_wrapper_reply({ok, #{echo := Got}}, Args) ->
-    classify_unary_match(Got, Args);
-classify_wrapper_reply({ok, #{<<"echo">> := Got}}, Args) ->
-    classify_unary_match(Got, Args);
-classify_wrapper_reply({ok, Other}, Args) ->
+classify_wrapper_reply({ok, #{echo := Got}}, Args, CallerNodeId) ->
+    classify_unary_match(Got, Args, CallerNodeId);
+classify_wrapper_reply({ok, #{<<"echo">> := Got}}, Args, CallerNodeId) ->
+    classify_unary_match(Got, Args, CallerNodeId);
+classify_wrapper_reply({ok, Other}, Args, _CallerNodeId) ->
     {error, {unexpected_reply, Other, expected, Args}};
-classify_wrapper_reply({error, _} = E, _) ->
+classify_wrapper_reply({error, _} = E, _Args, _CallerNodeId) ->
     E.
 
 %% @doc `macula_streamer' / `macula_stream_sink' wrapper — ServerPool

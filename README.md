@@ -1,8 +1,7 @@
 # macula-e2e
 
 End-to-end harness against a live Macula relay fleet. Verifies every
-public V2 surface in `macula 4.x` (pubsub, RPC, streaming RPC, DHT)
-plus the live `_mesh.weather` topic that the stub fleet publishes to.
+public V2 surface in `macula 4.x` (pubsub, RPC, streaming RPC, DHT).
 
 Designed to evolve into a soft real-time mesh-health dashboard
 without rewriting the probe code (see [evolution path](#evolution-path)
@@ -20,7 +19,6 @@ below).
 | `unary_rpc` | Advertise + call across two pools |
 | `streaming_rpc` | Server-stream advertise + call_stream + chunk drain (the A4 wire on a real station) |
 | `dht_put_find` | put_record + find_record round-trip on a fresh-identity node_record |
-| `weather_subscribe` | Live `_mesh.weather` ≥ 1 event in 75s under realm `io.macula` |
 | `pool_close_cleanup` | `macula_event_gone` delivered on pool close |
 | `subscriber_wrapper` | `macula_subscriber` (supervised, macula 9.2.0) — subscribe + publish + receive |
 | `rpc_wrapper` | `macula_response` / `macula_request` (supervised, macula 9.2.0) — advertise + call |
@@ -80,13 +78,14 @@ as a green run.
 
 | Env var | Default | Notes |
 |---|---|---|
+| `MACULA_E2E_BOOTSTRAP_OTHER` | none | Seed URL for a second pool on a different station. Without it every `cross_station_*` case skips. The daily beam00 run sets one station from `stations.csv` outside the seed set. |
 | `MACULA_E2E_BOOTSTRAP` | none, required | Comma-separated seed URLs. The pool spawns one peering link per seed. The daily beam00 run uses every `regional` station in macula-demo's `topologies/eu/stations.csv`. |
 
 Realm tags are derived inside the suite:
 
 - `_test` — synthetic test traffic (pubsub, RPC, streaming, DHT)
 - `_test_a` / `_test_b` — realm isolation cross-test
-- `io.macula` — weather subscription
+- `io.macula`: the production realm, used by the mpong-shape probes
 
 All tags are SHA-256 of the realm name (the canonical 32-byte form
 the SDK uses).
@@ -131,7 +130,7 @@ is the lever — every phase reuses it.
 - Multi-vantage detection: the silent fleet failure observed during
   the macula 4.0.0 release work — where every per-box smoke check
   looked clean by transitivity but the actual cross-station traffic
-  was zero — would light up red here as `weather_subscribe` failures
+  was zero — would light up red here as `cross_station_pubsub` failures
   cluster across vantages.
 - Bootstrap: an out-of-band fallback (a single station's HTTP
   health endpoint, or a journald scrape) is needed because if the

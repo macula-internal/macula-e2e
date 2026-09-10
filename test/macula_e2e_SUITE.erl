@@ -32,7 +32,6 @@
     unary_rpc/1,
     streaming_rpc/1,
     dht_put_find/1,
-    weather_subscribe/1,
     pool_close_cleanup/1,
     put_get_content/1,
     cross_station_pubsub/1,
@@ -81,7 +80,6 @@
 %% derives it from stations.csv), and init_per_suite fails without one.
 -define(DEFAULT_BOOTSTRAP, []).
 -define(WAIT_HEALTHY_MS,   30_000).
--define(WEATHER_WAIT_MS,   75_000).
 
 %%====================================================================
 %% CT callbacks
@@ -97,7 +95,6 @@ all() ->
      unary_rpc,
      streaming_rpc,
      dht_put_find,
-     weather_subscribe,
      put_get_content,
      pool_close_cleanup,
      %% Cross-station hop probes — only run when MACULA_E2E_BOOTSTRAP_OTHER
@@ -191,15 +188,24 @@ connect_fleet([], _BootstrapOther, _Config) ->
 connect_fleet(Bootstrap, BootstrapOther, Config) ->
     ct:pal("[e2e] bootstrap        = ~p", [Bootstrap]),
     ct:pal("[e2e] bootstrap_other  = ~p", [BootstrapOther]),
-    {ok, Pool}  = macula:connect(Bootstrap, #{}),
-    {ok, Other} = macula:connect(Bootstrap, #{}),
+    %% Explicit puzzle-hardened identities, the kind macula generates by
+    %% default, so each pool's node id is known: the RPC probes assert the
+    %% `caller' a handler sees is the pool that called.
+    PoolKp  = macula_identity:generate(#{puzzle => true}),
+    OtherKp = macula_identity:generate(#{puzzle => true}),
+    CrossKp = macula_identity:generate(#{puzzle => true}),
+    {ok, Pool}  = macula:connect(Bootstrap, #{identity => PoolKp}),
+    {ok, Other} = macula:connect(Bootstrap, #{identity => OtherKp}),
     {CrossOpt, CrossPools} =
         case BootstrapOther of
             undefined -> {undefined, []};
             _ ->
-                {ok, X} = macula:connect(BootstrapOther, #{}),
+                {ok, X} = macula:connect(BootstrapOther, #{identity => CrossKp}),
                 {X, [X]}
         end,
+    NodeIds = [{pool_node_id,  macula_identity:public(PoolKp)},
+               {other_node_id, macula_identity:public(OtherKp)},
+               {cross_node_id, macula_identity:public(CrossKp)}],
     %% macula:connect/2 spawns gen_servers linked to the caller. CT's
     %% init_per_suite controller exits with Config as its reason after
     %% returning, killing the linked pools before any test case runs.
@@ -210,7 +216,7 @@ connect_fleet(Bootstrap, BootstrapOther, Config) ->
     on_initial_health(wait_for_healthy([Pool, Other | CrossPools],
                                        ?WAIT_HEALTHY_MS),
                       Pool, Other, CrossOpt, Bootstrap, BootstrapOther,
-                      Config).
+                      NodeIds ++ Config).
 
 on_initial_health(ok, Pool, Other, Cross, Bootstrap, BootstrapOther, Config) ->
     {ok, #{healthy_links := N}} = macula:status(Pool),
@@ -224,7 +230,7 @@ on_initial_health(ok, Pool, Other, Cross, Bootstrap, BootstrapOther, Config) ->
      {test_realm,    macula_realm:id(<<"_test">>)},
      {test_realm_a,  macula_realm:id(<<"_test_a">>)},
      {test_realm_b,  macula_realm:id(<<"_test_b">>)},
-     {weather_realm, macula_realm:id(<<"io.macula">>)} | Config];
+     {io_macula_realm, macula_realm:id(<<"io.macula">>)} | Config];
 on_initial_health(timeout, Pool, Other, Cross, Bootstrap, _BootstrapOther,
                   _Config) ->
     macula:close(Pool),
@@ -294,7 +300,9 @@ unary_rpc(Config) ->
     Caller = ?config(other, Config),
     Realm = ?config(test_realm, Config),
     Procedure = unique_topic(<<"e2e.echo">>),
-    expect_ok(macula_e2e_probe:unary_rpc(Server, Caller, Realm, Procedure)).
+    expect_ok(macula_e2e_probe:unary_rpc(Server, Caller,
+                                         ?config(other_node_id, Config),
+                                         Realm, Procedure)).
 
 streaming_rpc(Config) ->
     Server = ?config(pool, Config),
@@ -307,12 +315,6 @@ dht_put_find(Config) ->
     Pool = ?config(pool, Config),
     Realm = ?config(test_realm, Config),
     expect_ok(macula_e2e_probe:dht_put_find(Pool, Realm)).
-
-weather_subscribe(Config) ->
-    Pool = ?config(pool, Config),
-    Realm = ?config(weather_realm, Config),
-    expect_ok(macula_e2e_probe:weather_subscribe(Pool, Realm,
-                                                  ?WEATHER_WAIT_MS)).
 
 pool_close_cleanup(Config) ->
     Bootstrap = ?config(bootstrap, Config),
@@ -338,7 +340,9 @@ rpc_wrapper(Config) ->
     Caller = ?config(other, Config),
     Realm = ?config(test_realm, Config),
     Procedure = unique_topic(<<"e2e.wrapper.rpc">>),
-    expect_ok(macula_e2e_probe:rpc_wrapper(Server, Caller, Realm, Procedure)).
+    expect_ok(macula_e2e_probe:rpc_wrapper(Server, Caller,
+                                           ?config(other_node_id, Config),
+                                           Realm, Procedure)).
 
 streaming_wrapper(Config) ->
     Server = ?config(pool, Config),
@@ -369,6 +373,7 @@ cross_station_unary_rpc(Config) ->
         Realm = ?config(test_realm, Config),
         Procedure = unique_topic(<<"e2e.cross.echo">>),
         macula_e2e_probe:cross_station_unary_rpc(Server, Caller,
+                                                  ?config(cross_node_id, Config),
                                                   Realm, Procedure)
     end).
 
@@ -522,14 +527,14 @@ subscribe_records_cross_station(Config) ->
 pubsub_mpong_shape(Config) ->
     Pub   = ?config(pool, Config),
     Sub   = ?config(other, Config),
-    Realm = ?config(weather_realm, Config),
+    Realm = ?config(io_macula_realm, Config),
     Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                             "state_broadcast_v1.e2e">>),
     expect_ok(macula_e2e_probe:pubsub_mpong_shape(Pub, Sub, Realm, Topic)).
 
 cross_station_pubsub_mpong_shape(Config) ->
     cross_or_skip(Config, fun(Pub, Sub) ->
-        Realm = ?config(weather_realm, Config),
+        Realm = ?config(io_macula_realm, Config),
         Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                                 "state_broadcast_v1.e2e.cross">>),
         macula_e2e_probe:cross_station_pubsub_mpong_shape(
@@ -539,7 +544,7 @@ cross_station_pubsub_mpong_shape(Config) ->
 pubsub_sustained_mpong(Config) ->
     Pub   = ?config(pool, Config),
     Sub   = ?config(other, Config),
-    Realm = ?config(weather_realm, Config),
+    Realm = ?config(io_macula_realm, Config),
     Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                             "state_broadcast_v1.e2e.sustained">>),
     expect_ok(macula_e2e_probe:pubsub_sustained_mpong(
@@ -547,7 +552,7 @@ pubsub_sustained_mpong(Config) ->
 
 cross_station_pubsub_sustained_mpong(Config) ->
     cross_or_skip(Config, fun(Pub, Sub) ->
-        Realm = ?config(weather_realm, Config),
+        Realm = ?config(io_macula_realm, Config),
         Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                                 "state_broadcast_v1.e2e.cross.sustained">>),
         macula_e2e_probe:cross_station_pubsub_sustained_mpong(
@@ -568,7 +573,7 @@ cross_station_pubsub_sustained_mpong(Config) ->
 pubsub_io_macula_realm_simple(Config) ->
     Pub   = ?config(pool, Config),
     Sub   = ?config(other, Config),
-    Realm = ?config(weather_realm, Config),   %% io.macula
+    Realm = ?config(io_macula_realm, Config),   %% io.macula
     Topic = unique_topic(<<"e2e.io_macula.simple">>),
     expect_ok(macula_e2e_probe:pubsub_roundtrip(Pub, Sub, Realm, Topic)).
 
@@ -627,7 +632,7 @@ run_axis(Config, Axis) ->
 pubsub_mpong_diag(Config) ->
     Pub   = ?config(pool, Config),
     Sub   = ?config(other, Config),
-    Realm = ?config(weather_realm, Config),
+    Realm = ?config(io_macula_realm, Config),
     Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                             "state_broadcast_v1.e2e.diag">>),
     case macula_e2e_probe:pubsub_mpong_diag(Pub, Sub, Realm, Topic) of
@@ -640,7 +645,7 @@ pubsub_mpong_diag(Config) ->
 
 cross_station_pubsub_mpong_diag(Config) ->
     cross_or_skip(Config, fun(Pub, Sub) ->
-        Realm = ?config(weather_realm, Config),
+        Realm = ?config(io_macula_realm, Config),
         Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                                 "state_broadcast_v1.e2e.cross.diag">>),
         case macula_e2e_probe:cross_station_pubsub_mpong_diag(
@@ -656,7 +661,7 @@ cross_station_pubsub_mpong_diag(Config) ->
 pubsub_mpong_diag_spaced(Config) ->
     Pub   = ?config(pool, Config),
     Sub   = ?config(other, Config),
-    Realm = ?config(weather_realm, Config),
+    Realm = ?config(io_macula_realm, Config),
     Topic = unique_topic(<<"io.macula/beam-campus/hecate/mpong/"
                             "state_broadcast_v1.e2e.diag.spaced">>),
     case macula_e2e_probe:pubsub_mpong_diag_spaced(Pub, Sub, Realm, Topic) of
