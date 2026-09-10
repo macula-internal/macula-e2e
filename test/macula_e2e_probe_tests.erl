@@ -76,3 +76,18 @@ manifest_mcid_is_chunked_test() ->
     {ok, #{mcid := Mcid, chunk_count := 4}, _Chunks} =
         macula_manifest:create(crypto:strong_rand_bytes(3 * 262_144 + 1_000)),
     ?assertEqual({ok, Mcid}, ?M:chunked_mcid(Mcid)).
+
+%% Seen live on 2026-09-10 (cross_station_pubsub_mpong_diag): every publish
+%% returned ok, sentinel-a, the first fact published, never arrived, and the
+%% suspect and sentinel-b did. The probe must name that outcome instead of
+%% reporting partial_delivery, and still fail.
+first_sentinel_missing_is_named_test() ->
+    Ctx = #{sent_a_token  => <<"sentinel-a">>,
+            suspect_token => <<"1">>,
+            sent_b_token  => <<"sentinel-b">>},
+    Events = [{<<"1">>, #{}}, {<<"sentinel-b">>, #{}}],
+    ?assertMatch({error, {first_fact_missing_later_facts_delivered,
+                          #{sentinel_a_got := false,
+                            suspect_got    := true,
+                            sentinel_b_got := true}}},
+                 ?M:classify_mpong_diag(Events, Ctx)).

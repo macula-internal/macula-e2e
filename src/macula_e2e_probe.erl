@@ -72,7 +72,7 @@
 ]).
 
 -ifdef(TEST).
--export([drain_pubsub_tokens/3, chunked_mcid/1]).
+-export([drain_pubsub_tokens/3, chunked_mcid/1, classify_mpong_diag/2]).
 -endif.
 
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
@@ -1214,6 +1214,9 @@ refusal_was_silent({error, _}, _Topic) -> ok.
 %%     (e.g. encoder function_clause that kills the link)
 %%   - Neither sentinel → wire was not up at all; probe environment
 %%     issue, not a payload bug
+%%   - Sentinel-A missing, suspect and sentinel-B delivered → the first
+%%     fact published was lost while the wire was up. Seen cross-station
+%%     on 2026-09-10 with every publish returning ok.
 %%
 %% Also captures `macula:status/1' for both pools before+after the
 %% publish phase so the report includes link health snapshots.
@@ -1353,6 +1356,8 @@ classify_mpong_diag(Events, Ctx) ->
             {error, {publish_path_died_after_suspect, Report}};
         {false, false, false} ->
             {error, {wire_not_up_during_test, Report}};
+        {false, true, true} ->
+            {error, {first_fact_missing_later_facts_delivered, Report}};
         _ ->
             {error, {partial_delivery, Report}}
     end.
