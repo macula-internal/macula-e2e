@@ -87,6 +87,18 @@
 -define(SETTLE_MS,          3_000).
 -define(EVENT_WAIT_MS,      8_000).
 -define(SILENCE_WAIT_MS,    4_000).
+%% Subscription-propagation convergence budget for rounds that fire a
+%% tight publish burst immediately after subscribing. `?SETTLE_MS' is
+%% enough on a single-hop pair but races the mesh's own bloom-exchange
+%% debounce (2s PER HOP, see macula_station_bloom_exchange.erl) on the
+%% fleet's one genuine two-hop pair, where convergence needs that to
+%% happen twice in sequence. Confirmed live 2026-08-27:
+%% `pubsub_ordering'/`pubsub_no_duplicates' lost exactly the EARLIEST
+%% published event(s) in ~50% of runs on helsinki<->nuremberg, never on
+%% any single-hop pair -- the signature of a subscription race, not a
+%% steady-state ordering or dedup defect.
+-define(CONVERGE_WAIT_MS,  20_000).
+-define(CONVERGE_POLL_MS,     500).
 -define(CALL_TIMEOUT_MS,   10_000).
 -define(ORDERED_EVENTS,        25).
 -define(CONCURRENT_CALLERS,    24).
@@ -488,14 +500,18 @@ on_live_before_unsub(ok, PoolA, PoolB, Realm, Topic, Ref) ->
 pubsub_ordering(A, B) ->
     Realm = macula_e2e_service:realm(A),
     Topic = macula_e2e_service:topic(A, <<"order">>),
-    {ok, Ref} = macula:subscribe(macula_e2e_service:pool(B), Realm, Topic,
-                                 self()),
-    timer:sleep(?SETTLE_MS),
+    PoolA = macula_e2e_service:pool(A),
+    PoolB = macula_e2e_service:pool(B),
+    {ok, Ref} = macula:subscribe(PoolB, Realm, Topic, self()),
+    Result = on_converged(await_subscribed(PoolA, Realm, Topic, Ref),
+                          fun() -> ordered_burst(PoolA, Realm, Topic, Ref) end),
+    catch macula:unsubscribe(PoolB, Ref),
+    Result.
+
+ordered_burst(PoolA, Realm, Topic, Ref) ->
     Seq = lists:seq(1, ?ORDERED_EVENTS),
-    [ok = macula:publish(macula_e2e_service:pool(A), Realm, Topic,
-                         #{<<"i">> => I}) || I <- Seq],
+    [ok = macula:publish(PoolA, Realm, Topic, #{<<"i">> => I}) || I <- Seq],
     Got = collect_indices(Ref, length(Seq), ?EVENT_WAIT_MS, []),
-    catch macula:unsubscribe(macula_e2e_service:pool(B), Ref),
     classify_order(Got, Seq).
 
 classify_order(Seq, Seq)  -> ok;
@@ -526,16 +542,20 @@ inversions(List) ->
 pubsub_no_duplicates(A, B) ->
     Realm = macula_e2e_service:realm(A),
     Topic = macula_e2e_service:topic(A, <<"dup">>),
-    {ok, Ref} = macula:subscribe(macula_e2e_service:pool(B), Realm, Topic,
-                                 self()),
-    timer:sleep(?SETTLE_MS),
+    PoolA = macula_e2e_service:pool(A),
+    PoolB = macula_e2e_service:pool(B),
+    {ok, Ref} = macula:subscribe(PoolB, Realm, Topic, self()),
     Seq = lists:seq(1, ?ORDERED_EVENTS),
-    [ok = macula:publish(macula_e2e_service:pool(A), Realm, Topic,
-                         #{<<"i">> => I}) || I <- Seq],
+    Result = on_converged(await_subscribed(PoolA, Realm, Topic, Ref),
+                          fun() -> duplicate_burst(PoolA, Realm, Topic, Ref, Seq) end),
+    catch macula:unsubscribe(PoolB, Ref),
+    Result.
+
+duplicate_burst(PoolA, Realm, Topic, Ref, Seq) ->
+    [ok = macula:publish(PoolA, Realm, Topic, #{<<"i">> => I}) || I <- Seq],
     %% Drain PAST the expected count — a duplicate only shows up as an
     %% extra arrival after the last unique one.
     Got = drain_indices_until_quiet(Ref, ?EVENT_WAIT_MS, []),
-    catch macula:unsubscribe(macula_e2e_service:pool(B), Ref),
     classify_duplicates(length(Got), lists:usort(Got), Seq).
 
 classify_duplicates(N, Unique, Seq) when N =:= length(Seq),
@@ -1631,6 +1651,50 @@ on_retry({error, _}, PubPool, Realm, Topic, Ref, Tag, Left) ->
 %%====================================================================
 %% Shared helpers
 %%====================================================================
+
+%% See `?CONVERGE_WAIT_MS' above for why this exists. Publishes a
+%% canary and waits for ANY delivery to arrive on `Ref' before the
+%% caller starts its real timed measurement, republishing every
+%% `?CONVERGE_POLL_MS' -- proves the subscription is genuinely routable
+%% rather than assuming it from a fixed sleep. Checking for presence
+%% rather than matching the canary's own content sidesteps the
+%% CBOR atomised-key-vs-binary-key normalisation `await_payload/3'
+%% needs -- safe here because the topic is namespaced per round
+%% instance and carries no other traffic. Flushes any leftover canary
+%% deliveries from the mailbox before returning, since one in flight
+%% when convergence completes can arrive more than once.
+await_subscribed(FromPool, Realm, Topic, Ref) ->
+    ok = macula:publish(FromPool, Realm, Topic, canary_payload()),
+    Result = poll_canary(FromPool, Realm, Topic, Ref, ?CONVERGE_WAIT_MS),
+    flush_events(Ref),
+    Result.
+
+canary_payload() -> #{<<"e2e_canary">> => true}.
+
+poll_canary(_FromPool, _Realm, _Topic, _Ref, Left) when Left =< 0 ->
+    {error, subscription_never_converged};
+poll_canary(FromPool, Realm, Topic, Ref, Left) ->
+    receive
+        {macula_event, Ref, _Topic, _Payload, _Meta} -> ok
+    after ?CONVERGE_POLL_MS ->
+        ok = macula:publish(FromPool, Realm, Topic, canary_payload()),
+        poll_canary(FromPool, Realm, Topic, Ref, Left - ?CONVERGE_POLL_MS)
+    end.
+
+%% Drain any messages left in the mailbox for this subscription
+%% without blocking.
+flush_events(Ref) ->
+    receive
+        {macula_event, Ref, _Topic, _Payload, _Meta} -> flush_events(Ref)
+    after 0 ->
+        ok
+    end.
+
+%% Run `Fun' only once the subscription has genuinely converged;
+%% otherwise report the convergence failure directly rather than
+%% letting it masquerade as an ordering/dedup defect.
+on_converged({error, _} = E, _Fun) -> E;
+on_converged(ok, Fun) -> Fun().
 
 call(Caller, Server, Suffix, Args, TimeoutMs) ->
     macula:call(macula_e2e_service:pool(Caller),
