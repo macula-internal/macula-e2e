@@ -69,7 +69,14 @@
     content_wrapper/2
 ]).
 
+-ifdef(TEST).
+-export([drain_pubsub_tokens/3]).
+-endif.
+
 -define(SUBSCRIBE_SETTLE_MS,  1_500).
+%% How long the multi-publisher probe waits for its senders after the
+%% drain: one publish call's own timeout (5 s + 500 ms) plus slack.
+-define(SENDER_WAIT_MS,       6_000).
 %% Bumped 1500 -> 3000 on 2026-05-13. The macula-station 4.x ADVERTISE
 %% propagation path is bounded by peer_observer's gen_server mailbox
 %% dispatch latency, which under live-fleet DHT load (~85% of inbound
@@ -340,11 +347,16 @@ cross_station_streaming_rpc(ServerPool, CallerPool, Realm, Procedure) ->
 %%====================================================================
 
 %% @doc N concurrent senders fire M publishes each through the same
-%% pool; a single subscriber drains; assert all N*M unique tokens
-%% land within the deadline. Stresses the relay's pubsub_server
+%% pool; a single subscriber drains; assert all N*M tokens land
+%% within the deadline. Stresses the relay's pubsub_server
 %% gen_server mailbox + the fan-out path under burst load. Token
-%% bytes encode (sender_idx, message_idx) so the assertion catches
-%% duplicates AND drops.
+%% bytes encode (sender_idx, message_idx), so a failure names each
+%% missing `{SenderIdx, MessageIdx}' pair; a repeat counts once.
+%%
+%% Every publish result is kept. A publish that did not return `ok',
+%% or a sender that crashed or had not finished, fails the probe with
+%% `publish_failed' next to what the drain saw, so a refusal on the
+%% sending side is never taken for an event the mesh lost.
 %%
 %% Same pool for all senders (sequential publish_seq counter
 %% — the SDK's outbound_link gen_server serialises). The stress
@@ -359,17 +371,18 @@ multi_publisher_pubsub(NumSenders, MsgsPerSender,
                       PubPool, SubPool, Realm, Topic) ->
     {ok, SubRef} = macula:subscribe(SubPool, Realm, Topic, self()),
     timer:sleep(?SUBSCRIBE_SETTLE_MS),
-    Senders = [spawn_link(fun() ->
-        run_sender(I, MsgsPerSender, PubPool, Realm, Topic)
+    Senders = [spawn_monitor(fun() ->
+        exit({published, run_sender(I, MsgsPerSender, PubPool, Realm, Topic)})
     end) || I <- lists:seq(1, NumSenders)],
-    Total  = NumSenders * MsgsPerSender,
+    Tokens = [sender_token(I, K) || I <- lists:seq(1, NumSenders),
+                                    K <- lists:seq(1, MsgsPerSender)],
     %% Drain budget: 200ms per expected event, floor 5s, ceiling
     %% 30s. Keeps cheap tests cheap and big tests bounded.
-    Budget = max(5_000, min(30_000, Total * 200)),
-    Result = drain_unique_pubsub_events(SubRef, Total, Budget),
-    [exit(Pid, kill) || Pid <- Senders],
+    Budget = max(5_000, min(30_000, length(Tokens) * 200)),
+    Drained = drain_pubsub_tokens(SubRef, sets:from_list(Tokens), Budget),
+    Refusals = await_senders(lists:enumerate(Senders), ?SENDER_WAIT_MS),
     catch macula:unsubscribe(SubPool, SubRef),
-    Result.
+    publish_verdict(Refusals, Drained).
 
 %% @doc Cross-station variant — Pub side dials one station, Sub
 %% side dials a different station. The N*M EVENTs all relay across
@@ -383,37 +396,71 @@ cross_station_multi_publisher_pubsub(NumSenders, MsgsPerSender,
     multi_publisher_pubsub(NumSenders, MsgsPerSender,
                            PubPool, SubPool, Realm, Topic).
 
+%% A sender's publishes that did not return `ok', as
+%% `{SenderIdx, MessageIdx, Result}'.
 run_sender(SenderIdx, MsgsPerSender, Pool, Realm, Topic) ->
-    [begin
-        Token = <<SenderIdx:8, K:24>>,
-        catch macula:publish(Pool, Realm, Topic, #{<<"token">> => Token})
-     end || K <- lists:seq(1, MsgsPerSender)],
-    ok.
+    Results = [{SenderIdx, K,
+                macula:publish(Pool, Realm, Topic,
+                               #{<<"token">> => sender_token(SenderIdx, K)})}
+               || K <- lists:seq(1, MsgsPerSender)],
+    [Refusal || {_, _, Result} = Refusal <- Results, Result =/= ok].
 
-drain_unique_pubsub_events(SubRef, Expected, TimeoutMs) ->
-    drain_unique_pubsub_events(SubRef, Expected, sets:new(),
-                               erlang:monotonic_time(millisecond) + TimeoutMs).
+sender_token(SenderIdx, MessageIdx) -> <<SenderIdx:8, MessageIdx:24>>.
 
-drain_unique_pubsub_events(_SubRef, Expected, _Got, _Deadline)
-  when Expected =< 0 -> ok;
-drain_unique_pubsub_events(SubRef, Expected, Got, Deadline) ->
+token_pair(<<SenderIdx:8, MessageIdx:24>>) -> {SenderIdx, MessageIdx}.
+
+%% A sender exits with `{published, Refusals}'. A sender that crashed
+%% (a publish call that times out exits its caller) or is still
+%% publishing when the wait ends is reported as well: its publishes
+%% were never confirmed.
+await_senders(Senders, WaitMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + WaitMs,
+    lists:append([await_sender(I, Pid, Mon, Deadline)
+                  || {I, {Pid, Mon}} <- Senders]).
+
+await_sender(SenderIdx, Pid, Mon, Deadline) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Mon, process, Pid, {published, Refusals}} -> Refusals;
+        {'DOWN', Mon, process, Pid, Reason} -> [{SenderIdx, crashed, Reason}]
+    after Remaining ->
+        erlang:demonitor(Mon, [flush]),
+        exit(Pid, kill),
+        [{SenderIdx, unfinished}]
+    end.
+
+publish_verdict([], Drained) ->
+    Drained;
+publish_verdict(Refusals, Drained) ->
+    {error, {publish_failed, Refusals, drained, Drained}}.
+
+%% Wait until every expected token has arrived on `SubRef' or the
+%% budget runs out. A token that is not expected (a payload without
+%% one, say) or that arrives again changes nothing.
+drain_pubsub_tokens(SubRef, Expected, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    drain_pubsub_tokens(sets:is_empty(Expected), SubRef, Expected,
+                        sets:size(Expected), Deadline).
+
+drain_pubsub_tokens(true, _SubRef, _Missing, _Total, _Deadline) ->
+    ok;
+drain_pubsub_tokens(false, SubRef, Missing, Total, Deadline) ->
     Remaining = max(1, Deadline - erlang:monotonic_time(millisecond)),
     receive
         {macula_event, SubRef, _Topic, Payload, _Meta} ->
-            Token = extract_token(Payload),
-            NewGot = sets:add_element(Token, Got),
-            drain_pubsub_progress(sets:size(NewGot) - sets:size(Got),
-                                  SubRef, Expected, NewGot, Deadline)
+            Left = sets:del_element(extract_token(Payload), Missing),
+            drain_pubsub_tokens(sets:is_empty(Left), SubRef, Left,
+                                Total, Deadline)
     after Remaining ->
-        {error, {missing_pubsub_events,
-                 missing, Expected,
-                 received_unique, sets:size(Got)}}
+        missing_pubsub_events(Missing, Total)
     end.
 
-drain_pubsub_progress(1, SubRef, Expected, NewGot, Deadline) ->
-    drain_unique_pubsub_events(SubRef, Expected - 1, NewGot, Deadline);
-drain_pubsub_progress(0, SubRef, Expected, NewGot, Deadline) ->
-    drain_unique_pubsub_events(SubRef, Expected, NewGot, Deadline).
+missing_pubsub_events(Missing, Total) ->
+    Pairs = lists:sort([token_pair(T) || T <- sets:to_list(Missing)]),
+    {error, {missing_pubsub_events,
+             missing, length(Pairs),
+             received_unique, Total - length(Pairs),
+             missing_pairs, Pairs}}.
 
 extract_token(Payload) ->
     case normalise_keys(Payload) of
