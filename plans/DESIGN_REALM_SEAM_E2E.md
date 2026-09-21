@@ -176,6 +176,7 @@ exactly one link, so the gate cannot pass for an adjacent reason.
 | 3 | stop the service after it advertised | refusal |
 | 4 | **handler returns the wrong payload** | assertion fails |
 | 5 | **delegation past its expiry** | refusal, `authorization_outlived` |
+| 6 | **the gate's own compose network misconfigured** | red on the artefact, **never on a timeout** |
 
 **(4) is the one that matters most**: it is the only break a `{ok, _}` gate sails
 straight through, so it is what proves this gate is not the old one.
@@ -187,6 +188,19 @@ a hole nothing else in the estate would catch.
 
 ⚠ Bound expiry **relatively** and drive it with explicit readings. An absolute
 expiry plus a sleep is a flaky test waiting to happen.
+
+**(6) is a break in the gate's own scaffolding, and it is there because the
+estate already wrote down how it fails.** mcl-echo's `deploy/docker-compose.yml`
+says a bridged container with no IPv6 "connects and then sits there with no
+healthy links, looking fine". That is the lying-station shape: everything
+adjacent stays green and nothing errors.
+
+So the compose network's configuration is something this gate **asserts against,
+never assumes**. ⚠ And the assertion must land on the artefact. A timeout is not
+good enough, and neither is `healthy_links > 0`, which is macula#18, known
+necessary and not sufficient. This is the same class as the `0644` key file in
+(7): the second place today where the instrument built to catch a failure could
+have carried that failure itself.
 
 ## 5. Out of scope, deliberately
 
