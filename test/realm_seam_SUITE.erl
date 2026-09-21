@@ -43,7 +43,8 @@
          init_per_testcase/2, end_per_testcase/2]).
 
 -export([a_spawned_station_serves_its_own_endpoint_record/1,
-         a_published_trust_list_makes_the_realm_checkable/1]).
+         a_published_trust_list_makes_the_realm_checkable/1,
+         the_realm_loads_the_signing_key_we_published/1]).
 
 %% Run on the station's peer node.
 -export([on_station_trust_pairs/0]).
@@ -52,7 +53,8 @@ suite() -> [{timetrap, {minutes, 5}}].
 
 all() ->
     [a_spawned_station_serves_its_own_endpoint_record,
-     a_published_trust_list_makes_the_realm_checkable].
+     a_published_trust_list_makes_the_realm_checkable,
+     the_realm_loads_the_signing_key_we_published].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(macula),
@@ -152,8 +154,83 @@ a_published_trust_list_makes_the_realm_checkable(Config) ->
     end.
 
 %%====================================================================
+%% Steps 6 and 7: the realm loads OUR key, and we do not take its word.
+%%====================================================================
+
+%% @doc The realm must sign its chains with the key whose key id we put
+%% in the trust list at step 3. If it signs with any other, every chain
+%% it issues is unverifiable against a station that trusts us, and the
+%% failure surfaces far away from its cause.
+%%
+%% ⛔ THE TRAP THIS EXISTS FOR. `RealmSigningKey.load_or_generate_and_cache/0'
+%% is `case :macula_node_keys.load(path, :realm, profile) do {:ok, k} -> k;
+%% {:error, _} -> generate_and_persist(...) end'. THE ERROR IS DISCARDED, and
+%% the module logs when the SAVE fails, never when the LOAD does.
+%% `macula_node_keys:load/3' refuses on key_file_permissions, bad_key_file,
+%% wrong_purpose, wrong_profile and wrong_algorithms, and every one lands in
+%% that silent branch. The permission gate is `Mode band 8#077 =:= 0', so the
+%% file must be 0600 or 0400.
+%%
+%% So a realm handed a key file it cannot read BOOTS CLEAN, LOGS NOTHING, and
+%% holds a different key than the one you published. This case is the design's
+%% own artefact rule turned on its own scaffolding: do not trust a setup step
+%% because it ran.
+the_realm_loads_the_signing_key_we_published(Config) ->
+    RealmKey = mint_realm_signing_key(),
+    KeyPath = filename:join(?config(priv_dir, Config), "realm-key.pq.bin"),
+    ok = save_realm_key(KeyPath, RealmKey),
+
+    Realm = start_realm_node(KeyPath),
+    try
+        %% The artefact: the key id the REAL production module ends up
+        %% holding, read out of the realm, compared with what we minted
+        %% and would have published. Not "the realm started".
+        ?assertEqual(macula_node_keys:key_id(RealmKey),
+                     peer:call(Realm, 'Elixir.MaculaRealm.Identity.RealmSigningKey',
+                               key_id, [], 30_000))
+    after
+        peer:stop(Realm)
+    end.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
+
+%% ⚠ 0600. `macula_node_keys:load/3' gates on `owner_only_read', which is
+%% `Mode band 8#077 =:= 0'. A key file with default permissions is refused,
+%% and RealmSigningKey turns that refusal into a silently different key.
+save_realm_key(Path, Key) ->
+    ok = filelib:ensure_dir(Path),
+    ok = macula_node_keys:save(Path, Key),
+    ok = file:change_mode(Path, 8#600).
+
+%% A bare peer carrying macula-realm's compiled tree and Elixir's own, for
+%% calling the realm's production modules. It runs no station: stations come
+%% from the harness, on their own nodes.
+start_realm_node(KeyPath) ->
+    %% `connection => standard_io' and `peer:start', matching the station
+    %% harness: the driver stays NON-DISTRIBUTED, so no net_kernel and no
+    %% node-name collisions between concurrent runs. `peer:start_link' here
+    %% would also tie the peer's life to the transient CT case process.
+    {ok, Peer, _Node} = peer:start(
+                          #{name => peer:random_name(realm_seam),
+                            connection => standard_io,
+                            args => ["-pa" | realm_code_path()]}),
+    ok = peer:call(Peer, application, set_env, [macula, crypto_profile, profile()]),
+    ok = peer:call(Peer, application, set_env, [macula_realm, realm_key_path, KeyPath]),
+    {ok, _} = peer:call(Peer, application, ensure_all_started, [macula], 60_000),
+    Peer.
+
+%% macula-realm is a mix project and is not a rebar3 dependency of anything
+%% here, so its tree is located rather than depended on. `MACULA_REALM_BUILD'
+%% overrides for a checkout somewhere else.
+realm_code_path() ->
+    Build = os:getenv("MACULA_REALM_BUILD",
+                      "/home/rl/work/github.com/macula-io/macula-realm/_build/test/lib"),
+    Elixir = os:getenv("ELIXIR_LIB",
+                       "/home/rl/.local/share/mise/installs/elixir/1.20.4-otp-28/lib"),
+    filelib:wildcard(filename:join(Build, "*/ebin"))
+        ++ filelib:wildcard(filename:join(Elixir, "*/ebin")).
 
 %% Step 0 of the ordering: the REALM SIGNING key, minted by the test.
 %%
