@@ -50,17 +50,33 @@ station's port is ephemeral and not knowable in advance.
 The order is therefore fixed and is not a matter of taste:
 
 ```
-1. spawn the station          -> macula_station_test_cluster:spawn_cluster/2
-                                 gives a peer node with a real QUIC listener
+0. mint BOTH keys, before anything boots
+     - a foundation keypair; its key id goes on the station at step 1
+     - the REALM SIGNING key:
+         {ok, K} = macula_node_keys:generate(realm, Profile, #{})
+         ok      = macula_node_keys:save(Path, K)
+         KeyId   = macula_node_keys:key_id(K)
+       Profile MUST be MaculaRealm.Identity.profile(), and Path MUST end
+       up mode 0600 or 0400. See 3b, this is a trap.
+1. spawn the station          -> with macula app env `foundation_key_ids'
+                                 set to the foundation key id, BEFORE
+                                 macula starts
 2. read back its identity     -> listen_addr/1 (address + ephemeral port)
                                  pubkey/1     (32-byte node id)
-3. set the realm's seeds      -> on the REALM's node, BEFORE its app starts
-4. start the realm app        -> now, and not before
-5. realm issues the chain     -> org_directory (realm-signed)
+3. PUT the trust list         -> foundation-signed, pairing the realm id
+                                 with the realm signing KeyId from step 0
+4. force a trust refresh      -> and ASSERT trust_pairs is populated; 3c
+5. configure the realm        -> on the REALM's node, BEFORE its app starts:
+                                 :station_seeds  (from step 2)
+                                 :realm_key_path (Path from step 0)
+6. start the realm app        -> it LOADS the key at step 0, does not mint
+7. ASSERT the loaded key      -> RealmSigningKey.key_id() =:= KeyId.
+                                 Do not trust the load. See 3b.
+8. realm issues the chain     -> org_directory (realm-signed)
                                  + procedure_delegation (org-signed, names
                                    mcl-echo's node id)
-6. boot mcl-echo on mcl_om    -> it resolves the chain and advertises
-7. client pool calls echo     -> assert <<"pong">>
+9. boot mcl-echo on mcl_om    -> it resolves the chain and advertises
+10. client pool calls echo    -> assert <<"pong">>
 ```
 
 Steps 2 and 3 are where this gets got wrong. Setting the seeds from inside a
@@ -84,6 +100,69 @@ entirely. Set it on the realm's node at step 3.
 This is a defect in its own right and is **not ours to fix here**: the public
 fleet is AAAA-only and is headed for addresses rather than DNS, and this parser
 can only ever name a station by hostname. Routed to the realm's owner.
+
+### ⚠ 3b. TWO things are called "the realm key". Read the right one.
+
+`macula-realm` holds two unrelated objects under that name, and matching on the
+name gets you the wrong one. `RealmSigningKey`'s own moduledoc warns about it.
+
+| | `GuideRealmLifecycle.RealmKey` | `MaculaRealm.Identity.RealmSigningKey` |
+|---|---|---|
+| what | `K_realm`, a **256-bit symmetric** key | the **D25 signing** key |
+| minted | `:crypto.strong_rand_bytes(32)`, sealed AES-256-GCM | `macula_node_keys:generate/3` |
+| lifecycle | event-sourced, `realm_key_rotated_v1` | **load-or-generate from a file** |
+| for | wrapping per-file content keys for realm licenses | signs `org_directory`; its public half is the trust pin every provider and caller pool holds |
+
+**`K_realm` is symmetric. It cannot sign and has no key id**, so it cannot be
+what a trust list pairs a realm id to. **The one this design needs is
+`RealmSigningKey`**, and because it is load-or-generate from
+`:macula_realm, :realm_key_path` it CAN be minted by the test up front. That is
+why step 0 needs no realm boot.
+
+#### ⛔ The trap: the load fails silently and mints a different key
+
+`load_or_generate_and_cache/0` is `case :macula_node_keys.load(path, :realm,
+profile) do {:ok, k} -> k; {:error, _} -> generate_and_persist(...) end`. **The
+error is discarded.** `RealmSigningKey` logs when the SAVE fails and never when
+the LOAD does.
+
+`macula_node_keys:load/3` has five refusal paths, and every one lands in that
+silent branch: `key_file_permissions`, `bad_key_file`, `{wrong_purpose, _}`,
+`{wrong_profile, _}`, `{wrong_algorithms, _}`. The permission gate is
+`owner_only_read`, `Mode band 8#077 =:= 0`, so **the key file must be 0600 or
+0400**.
+
+A key file with default permissions, or minted under a different crypto profile
+than the realm is configured for, therefore gives you a realm that **boots
+clean, reports nothing, and holds a different key id than your trust list
+pins**. It surfaces later as an unverifiable chain, nowhere near the cause.
+
+Three cheap defences, all of them required: `chmod 0600` the file, mint under
+`MaculaRealm.Identity.profile()`, and **assert at step 7 that the booted realm's
+`RealmSigningKey.key_id()` equals the key id published at step 0.** That last one
+is this document's own rule applied to its own setup: do not trust a step that
+ran, assert the artefact.
+
+### ⚠ 3c. The station's trust list is a DHT record, not configuration
+
+`macula_dht_server:newest_trust_list/1` flatmaps over
+`macula_foundation:live_key_ids()` and looks up
+`macula_record:foundation_realm_trust_list_key(KeyId)` for each. `live_key_ids/0`
+is `application:get_env(macula, foundation_key_ids)`, so **with nothing
+configured it returns `[]`**, the flatmap iterates nothing, `refresh_trust_list`
+takes its `error` branch and `trust_pairs` stays `undefined`.
+
+With no trust pairs no realm is checkable and `macula_dht_slots:place_kind/2`
+falls through to `unchecked` for every advertisement. **A gate that skips step 1
+therefore measures the unchecked slot path and never the production one**, and
+would not notice a regression in the path the fleet actually uses. Same shape as
+every other adjacent-object gate we have found this week.
+
+`?TRUST_REFRESH_MS` is **one hour**, and the PUT at step 3 necessarily happens
+after the station booted, so step 4 is not optional. It is a plain
+`handle_info(refresh_trust_list, _)`, so forcing it is an ordinary message send
+through the harness's `rpc/4`. **Assert `trust_pairs` is populated afterwards.**
+That is an explicit reading. Do not sleep and hope.
 
 ## 4. The breaks this gate must fail on
 
