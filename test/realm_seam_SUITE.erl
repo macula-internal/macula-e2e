@@ -23,6 +23,37 @@
 %%% If a self-hosted IPv6 runner ever lands, reason 2 still stands. DO
 %%% NOT point this suite at the real mesh.
 %%%
+%%% == ⚠ RED ON ARRIVAL, and it is the harness, not the suite ==
+%%%
+%%% A station spawned by `macula_station_test_cluster' fails with `undef'
+%%% on `macula_quic:listen/3'. That reads as a version mismatch and is
+%%% not one: `listen/3' exists in both 11.5.0 and 12. The module is not
+%%% loaded AT ALL, because its `on_load' cannot find the NIF, and every
+%%% function of such a module answers `undef'. The peer says so itself:
+%%%
+%%%   NIF load failed: '<project root>/priv/macula_quic.so:
+%%%     cannot open shared object file'
+%%%
+%%% On the peer, `code:priv_dir(macula)' resolves to the PROJECT ROOT's
+%%% `priv' rather than the build tree's. The library is present, and it
+%%% loads on the node that spawns the peer. Routed to macula-station:
+%%% the spawned node has to be able to resolve macula's application
+%%% directory before anything touches a macula module.
+%%%
+%%% Until that lands, every case here that spawns a station is red.
+%%%
+%%% == ⚠ Two local traps that cost an hour, in case they cost you one ==
+%%%
+%%% 1. `rebar.lock' is GITIGNORED. A lock left over from an older build
+%%%    can still pin `macula' 10.24.0 while `rebar.config' says `~> 11.4',
+%%%    and the lock wins, so nothing moves and the failure is a missing
+%%%    function in a module you are sure exists. `rebar3 upgrade macula'.
+%%%    A fresh clone has no lock and resolves correctly, so this is local
+%%%    staleness rather than a defect here.
+%%% 2. The NIF `.so' from the old version is REUSED after the upgrade,
+%%%    and a NIF built for another version does not load. Delete the
+%%%    build directory and rebuild with `MACULA_FORCE_SOURCE_BUILD=1'.
+%%%
 %%% == What it asserts on ==
 %%%
 %%% The artefact, never a step that ran. Not exit 0, not "the harness
@@ -39,10 +70,20 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+%% The one profile this seam runs under, on every node. See 3d.
+-define(PROFILE, pq_hybrid).
+
+%% What the fleet runs, confirmed on disk per station on 2026-09-23. The station
+%% falls back to `off' when the key is absent, which is the opposite, so a
+%% harness that inherits the default skips the puzzle check on every inbound
+%% handshake while looking green. See 3e.
+-define(PUZZLE_ENFORCEMENT, enforce).
+
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 
--export([a_spawned_station_serves_its_own_endpoint_record/1,
+-export([the_station_runs_the_profile_and_puzzle_mode_this_seam_names/1,
+         a_spawned_station_serves_its_own_endpoint_record/1,
          a_published_trust_list_makes_the_realm_checkable/1,
          the_realm_loads_the_signing_key_we_published/1]).
 
@@ -52,13 +93,34 @@
 suite() -> [{timetrap, {minutes, 5}}].
 
 all() ->
-    [a_spawned_station_serves_its_own_endpoint_record,
+    [the_station_runs_the_profile_and_puzzle_mode_this_seam_names,
+     a_spawned_station_serves_its_own_endpoint_record,
      a_published_trust_list_makes_the_realm_checkable,
      the_realm_loads_the_signing_key_we_published].
 
 init_per_suite(Config) ->
+    true = absolute_code_path(),
     {ok, _} = application:ensure_all_started(macula),
     Config.
+
+%% ⚠ Make every code path entry absolute before any station is spawned.
+%%
+%% `rebar3 ct' leaves RELATIVE entries in the code path (18 of 53 here: the
+%% project's own `_build/test/lib/*/ebin'), and Common Test runs a case with the
+%% working directory set to that run's log directory. `macula_station_test_cluster'
+%% passes `code:get_path()' to `peer:start' as `-pa' arguments verbatim, so a
+%% spawned station inherits those relative entries and resolves them against the
+%% wrong directory.
+%%
+%% What that looks like is worth knowing, because it does not look like a path
+%% problem: enough of the path is absolute that the peer boots and gets as far as
+%% starting the station's listener, and then `macula_quic' cannot be found. A
+%% module whose `on_load' cannot find its NIF is not loaded at all, so every
+%% function in it answers `undef' — and the failure reads as "macula_quic:listen/3
+%% does not exist", which sends you looking for a version mismatch that is not
+%% there.
+absolute_code_path() ->
+    code:set_path([filename:absname(P) || P <- code:get_path()]).  %% true
 
 end_per_suite(_Config) ->
     ok.
@@ -68,6 +130,42 @@ init_per_testcase(_Name, Config) ->
 
 end_per_testcase(_Name, _Config) ->
     ok.
+
+%%====================================================================
+%% Step 0: the profile and the puzzle, before anything else is believed
+%%====================================================================
+
+%% @doc The station runs the profile and the puzzle mode this seam names,
+%% read back FROM the station rather than assumed from what was passed.
+%%
+%% Neither is negotiated: every node has to be told, and two halves
+%% disagreeing surfaces much later as an unverifiable chain, nowhere near
+%% the cause. The harness has defaults for both, and one of them is the
+%% OPPOSITE of the fleet: `macula_station_config' falls back to
+%% `puzzle_enforcement = off' when the key is absent, while all six fleet
+%% stations run `enforce'. A seam that inherited that default would skip
+%% the puzzle check on every inbound handshake and still look green.
+%%
+%% This asserts the values the station actually holds, so a harness
+%% default that changes underneath us fails here rather than quietly
+%% moving what the seam measures.
+the_station_runs_the_profile_and_puzzle_mode_this_seam_names(Config) ->
+    Opts = ?config(cluster_opts, Config),
+    [B] = spawn_station(Opts, mint_foundation_key()),
+    try
+        ?assertEqual({ok, ?PROFILE},
+                     macula_station_test_cluster:rpc(
+                       B, macula_crypto_profile, configured, [])),
+        ?assertEqual(?PUZZLE_ENFORCEMENT,
+                     macula_station_test_cluster:rpc(
+                       B, application, get_env,
+                       [macula_station, puzzle_enforcement, undefined])),
+        %% And this node agrees with it, since the client pool that calls
+        %% the service runs here.
+        ?assertEqual({ok, ?PROFILE}, macula_crypto_profile:configured())
+    after
+        macula_station_test_cluster:stop_cluster([B])
+    end.
 
 %%====================================================================
 %% Step 1 and 2 of the ordering: a station exists, and it is REALLY a
@@ -88,9 +186,7 @@ end_per_testcase(_Name, _Config) ->
 a_spawned_station_serves_its_own_endpoint_record(Config) ->
     Opts = ?config(cluster_opts, Config),
     Foundation = mint_foundation_key(),
-    [B] = macula_station_test_cluster:spawn_cluster(
-            1, Opts#{app_env => [{macula, foundation_key_ids,
-                                  [macula_node_keys:key_id(Foundation)]}]}),
+    [B] = spawn_station(Opts, Foundation),
     try
         BPub = macula_station_test_cluster:pubkey(B),
         {_Ip, BPort} = macula_station_test_cluster:listen_addr(B),
@@ -246,8 +342,8 @@ mint_realm_signing_key() ->
 
 spawn_station(Opts, Foundation) ->
     macula_station_test_cluster:spawn_cluster(
-      1, Opts#{app_env => [{macula, foundation_key_ids,
-                            [macula_node_keys:key_id(Foundation)]}]}).
+      1, Opts#{app_env => station_env([{macula, foundation_key_ids,
+                                        [macula_node_keys:key_id(Foundation)]}])}).
 
 publish_trust_list(B, Foundation, RealmId, RealmKey) ->
     Rec = macula_record:sign(
@@ -300,8 +396,22 @@ mint_foundation_key() ->
     {ok, K} = macula_node_keys:generate(foundation, profile(), #{}),
     K.
 
+%% ⚠ ONE profile, named HERE as a value, set on every node and asserted. Not
+%% read from the environment with a fallback: a lookup whose default equals the
+%% value it is meant to find agrees with everything and catches nothing, and the
+%% two halves of this seam disagreeing surfaces as an unverifiable chain far
+%% from its cause. See 3d in the design.
 profile() ->
-    application:get_env(macula, crypto_profile, pq_hybrid).
+    ?PROFILE.
+
+%% The station's own `macula' and `macula_station' env, applied by the harness
+%% AFTER its own defaults and before `macula' starts. It pins the profile rather
+%% than inheriting the harness's, and the puzzle mode the FLEET runs rather than
+%% the `off' that `macula_station_config' falls back to when the key is absent.
+%% See 3d and 3e.
+station_env(Extra) ->
+    [{macula, crypto_profile, ?PROFILE},
+     {macula_station, puzzle_enforcement, ?PUZZLE_ENFORCEMENT} | Extra].
 
 station_endpoint(B, BPub) ->
     macula_station_test_cluster:rpc(
