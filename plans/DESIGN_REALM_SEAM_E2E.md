@@ -1,15 +1,8 @@
-> ⚠ **REVIEWED AND BEING CORRECTED.** Venus reviewed this against the trees and
-> found five things wrong with it. I agreed with all five; two were mistakes in
-> my reasoning rather than missing detail. Venus is amending this document in
-> place, so what you read below is current rather than a record of who thought
-> what. The five, and why they were wrong, are in the message of the commit that
-> added this note. Remove this note once the amendment lands.
-
 # DESIGN: the realm-seam E2E gate
 
 > **This exists so that a BEAM client can call mcl-echo through a real station,
-> authorized by a delegation a real macula-realm issued, and get `<<"pong">>` back
-> on a machine that has never heard of the public fleet.**
+> authorized by a delegation a real macula-realm issued, and get back exactly the
+> value THIS RUN sent, on a machine that has never heard of the public fleet.**
 
 That sentence is the test for everything below. Anything here that does not serve
 it does not belong here.
@@ -37,15 +30,32 @@ stands. **Do not point this suite at the real mesh.**
 
 ## 2. What it asserts on
 
-The artefact, never a step that ran. The assertion is `<<"pong">>` coming back
-from a call that crossed a real QUIC link to a service authorized by a
-realm-issued delegation.
+The artefact, never a step that ran, and the artefact has to be **this run's**.
 
 Not exit 0. Not "the harness completed". Not "the service advertised". Not
 `healthy_links > 0` (necessary, not sufficient, macula#18). **And not `{ok, _}`**,
 which is the shape that lets a broken handler through: `macula_station_call_station_SUITE`
 asserts `{ok, _}` on a `_dht.find_record` for a key nothing ever put, so it passes
 on "a well-formed reply came back" whatever the content.
+
+### ⚠ A constant payload asserts nothing about this run
+
+mcl-echo **returns the payload unchanged** (`mcl_echo_mesh_rpc:handle_request/2`),
+so the artefact is whatever the caller sent. Assert a constant and a cached
+answer, a replayed record or a fabricated reply matches exactly as well as a real
+one: the assertion carries no information the caller did not already have, and
+break 4 below becomes unfalsifiable, since the only way to fail it is to break the
+echo on purpose.
+
+**So the call sends a freshly generated random value on every run and asserts the
+reply carries exactly that value back.** That is what turns "a well-formed reply
+came back" into "this reply came from something that saw this run's request".
+
+⚠ **The reply is not term-equal to what was sent, and that is the codec, not a
+defect.** Send `#{<<"ping">> => Fresh}` and it comes back as
+`#{{text,<<"ping">>} => Fresh}`: the key tagged, the value not. So the assertion
+reads the value AT its key. A whole-term comparison fails against a perfectly
+healthy service, which costs an hour and reads like a product bug.
 
 ## 3. ⚠ The ordering, which is the crux
 
@@ -57,7 +67,13 @@ station's port is ephemeral and not knowable in advance.
 The order is therefore fixed and is not a matter of taste:
 
 ```
-0. mint BOTH keys, before anything boots
+0. settle the PROFILE and the PUZZLE, before any of it
+     - ONE crypto profile, named as a value, set on every node: the station
+       peer, the realm node, mcl-echo and the client pool. See 3d.
+     - puzzle_enforcement = enforce on the station, which is what the fleet
+       runs, so the client's identity must be GROUND, not merely generated.
+       See 3e.
+0b. mint BOTH keys, before anything boots
      - a foundation keypair; its key id goes on the station at step 1
      - the REALM SIGNING key:
          {ok, K} = macula_node_keys:generate(realm, Profile, #{})
@@ -71,19 +87,20 @@ The order is therefore fixed and is not a matter of taste:
 2. read back its identity     -> listen_addr/1 (address + ephemeral port)
                                  pubkey/1     (32-byte node id)
 3. PUT the trust list         -> foundation-signed, pairing the realm id
-                                 with the realm signing KeyId from step 0
+                                 with the realm signing KeyId from step 0b
 4. force a trust refresh      -> and ASSERT trust_pairs is populated; 3c
 5. configure the realm        -> on the REALM's node, BEFORE its app starts:
                                  :station_seeds  (from step 2)
-                                 :realm_key_path (Path from step 0)
-6. start the realm app        -> it LOADS the key at step 0, does not mint
+                                 :realm_key_path (Path from step 0b)
+6. start the realm app        -> it LOADS the key at step 0b, does not mint
 7. ASSERT the loaded key      -> RealmSigningKey.key_id() =:= KeyId.
                                  Do not trust the load. See 3b.
 8. realm issues the chain     -> org_directory (realm-signed)
                                  + procedure_delegation (org-signed, names
                                    mcl-echo's node id)
 9. boot mcl-echo on mcl_om    -> it resolves the chain and advertises
-10. client pool calls echo    -> assert <<"pong">>
+10. client pool calls echo    -> send a FRESH random value, assert the reply
+                                 carries exactly it, read at its key (2)
 ```
 
 Steps 2 and 3 are where this gets got wrong. Setting the seeds from inside a
@@ -124,7 +141,7 @@ name gets you the wrong one. `RealmSigningKey`'s own moduledoc warns about it.
 what a trust list pairs a realm id to. **The one this design needs is
 `RealmSigningKey`**, and because it is load-or-generate from
 `:macula_realm, :realm_key_path` it CAN be minted by the test up front. That is
-why step 0 needs no realm boot.
+why step 0b needs no realm boot.
 
 #### ⛔ The trap: the load fails silently and mints a different key
 
@@ -146,7 +163,7 @@ pins**. It surfaces later as an unverifiable chain, nowhere near the cause.
 
 Three cheap defences, all of them required: `chmod 0600` the file, mint under
 `MaculaRealm.Identity.profile()`, and **assert at step 7 that the booted realm's
-`RealmSigningKey.key_id()` equals the key id published at step 0.** That last one
+`RealmSigningKey.key_id()` equals the key id published at step 0b.** That last one
 is this document's own rule applied to its own setup: do not trust a step that
 ran, assert the artefact.
 
@@ -171,6 +188,42 @@ after the station booted, so step 4 is not optional. It is a plain
 through the harness's `rpc/4`. **Assert `trust_pairs` is populated afterwards.**
 That is an explicit reading. Do not sleep and hope.
 
+### ⚠ 3d. ONE profile, named as a value, asserted
+
+Nothing in the seam negotiates a crypto profile: every party has to be told the
+same one, and two halves disagreeing surfaces as an unverifiable chain nowhere
+near its cause, which is the failure 3b exists to prevent.
+
+- `macula_station_test_cluster` pins **`pq_hybrid`** on the station's peer node,
+  before `macula` starts, because `macula_app` refuses to start without exactly
+  one `crypto_profile`.
+- `RealmSigningKey` takes **the deployment's configured** profile, pq_hybrid or
+  pq_pure. It is not a constant to be read off the module.
+
+So "mint under `MaculaRealm.Identity.profile()`" is not enough on its own: it
+says *match whatever the realm happens to be configured for*, and the realm is
+configured by this harness. **Name the value, set it on every node, and assert
+it** on at least the station and the realm, the two that mint keys.
+
+### ⚠ 3e. The puzzle: the harness default is the opposite of the fleet
+
+`macula_station_config` defaults `puzzle_enforcement` to **`off`** when the key
+is absent. **All six fleet stations run `enforce`**, confirmed on disk per
+station on 2026-09-23, each box's bind-mount source read from `docker inspect`
+and sha256'd against the repo's copy.
+
+A gate that inherits the default therefore **skips the puzzle check on every
+inbound handshake while looking green**, and would not notice a regression in a
+path every production connection takes. This is section 3c's own argument, one
+level along: an adjacent-object default that quietly measures the wrong path.
+
+So: set `enforce` explicitly, assert it, and **grind the client's identity key**
+rather than generating one, since an unground node_id is refused with
+`puzzle_invalid` under enforce. The difficulty is **8**
+(`-define(PUZZLE_DIFFICULTY, 8)` in `macula_node_keys`, and the harness pins the
+same 8); about 72 ms of grinding. The raise to 12 is pending and is not this
+gate's business.
+
 ## 4. The breaks this gate must fail on
 
 Green proves nothing by itself; anything passes when things work. Each break cuts
@@ -181,12 +234,16 @@ exactly one link, so the gate cannot pass for an adjacent reason.
 | 1 | withhold the realm's delegation | refusal, **not a hang** |
 | 2 | issue the delegation to the wrong node id | refusal |
 | 3 | stop the service after it advertised | refusal |
-| 4 | **handler returns the wrong payload** | assertion fails |
+| 4 | **the reply does not carry THIS RUN's value** | assertion fails |
 | 5 | **delegation past its expiry** | refusal, `authorization_outlived` |
-| 6 | **the gate's own compose network misconfigured** | red on the artefact, **never on a timeout** |
 
 **(4) is the one that matters most**: it is the only break a `{ok, _}` gate sails
-straight through, so it is what proves this gate is not the old one.
+straight through, so it is what proves this gate is not the old one. Because
+mcl-echo echoes what it is given, the way to drive it is to have the caller
+compare against a value the service never saw: assert the reply carries the
+value sent by THIS run, and a stale, replayed or fabricated answer fails it. A
+constant payload cannot express this break at all, which is why section 2
+requires a fresh one.
 
 **(5) is a security case, not tidiness.** The chain is time-bounded and
 `macula_record:verify_authorization/3` enforces
@@ -196,56 +253,60 @@ a hole nothing else in the estate would catch.
 ⚠ Bound expiry **relatively** and drive it with explicit readings. An absolute
 expiry plus a sleep is a flaky test waiting to happen.
 
-**(6) is a break in the gate's own scaffolding, and it is there because the
-estate already wrote down how it fails.** mcl-echo's `deploy/docker-compose.yml`
-says a bridged container with no IPv6 "connects and then sits there with no
-healthy links, looking fine". That is the lying-station shape: everything
-adjacent stays green and nothing errors.
+**There is no break for the gate's own network, because this gate has no
+network to misconfigure.** The stations are spawned as BEAM peer nodes on one
+host by `macula_station_harness`, so there is no compose file, no bridge and no
+container. The hazard that break was written for is real and recorded elsewhere,
+in mcl-echo's `deploy/docker-compose.yml`: a bridged container with no IPv6
+"connects and then sits there with no healthy links, looking fine". **It applies
+to a containerised mechanism, and this is not one.** If this gate is ever moved
+to containers, that break comes back and needs a fact to read rather than a
+timeout to wait for.
 
-So the compose network's configuration is something this gate **asserts against,
-never assumes**. ⚠ And the assertion must land on the artefact. A timeout is not
-good enough, and neither is `healthy_links > 0`, which is macula#18, known
-necessary and not sufficient. This is the same class as the `0644` key file in
-(7): the second place today where the instrument built to catch a failure could
-have carried that failure itself.
+What survives from it, and is in section 2 already: the gate must never pass on a
+timeout, and never on `healthy_links > 0`, which is macula#18, known necessary
+and not sufficient.
 
 ## 5. Out of scope, deliberately
 
-- Repinning macula-e2e's existing ~50 cases from `{macula, "~> 10.5"}` to 11.x.
-  Separate follow-on item. It does not block this seam and this seam must not
-  wait on it.
+- **Fixing macula-e2e's existing ~50 cases so they pass on 11.x.** Follow-on, and
+  genuinely not blocking: they come back cheaply once the seam exists, because
+  what they need is what the seam builds, a pinned seed and a D25 chain in the DHT.
+  ⚠ **Do not confuse this with MOVING THE DEPENDENCY, which was blocking and is
+  done.** The repo pinned `{macula, "~> 10.5"}`; handshake `-define(VERSION, 3)`
+  first ships in **v11.0.0**, so a 10.5 client is closed with
+  `unsupported_version` by any 11.x or 12 station and the seam could not run at
+  all. The two were one bullet here and that is how a blocker ended up in an
+  out-of-scope list. They are separate jobs: the dependency is now `~> 11.4` with
+  the station apps at an exact macula-station sha, and the ~50 are still waiting.
 - `macula`'s own CI not running CT at all. Separate package, separate owner.
 - Fixing `macula_station_call_station_SUITE`'s `{ok, _}`. Belongs to the station's
   owner.
 - Fixing the realm's IPv6 seed parse. See 3a.
 
-## 6. ⛔ BLOCKED on one prerequisite, and it is not ours
+## 6. The prerequisite that blocked this, and how it was met
 
-Step 1 of the ordering cannot be written today. **There is no way for any repo
-except `macula-station` itself to spawn a station.**
-
-- `macula_station_test_cluster` and `macula_station_stub_tier` live in
-  `apps/macula_station/test/`. rebar3 does not compile a dependency's `test/`
-  directory, so a consumer gets neither, even with the dep in place.
-- `macula-station` is **not published to hex** (it has `ci.yml` and
-  `renovate.yml`, no publish workflow), so the dep would have to be a git dep,
-  which does not change the above.
-- Booting a station by hand from the public app API is not a small thing. It
-  needs the ephemeral-port claim with its TOCTOU window, a generated cert and
-  key, `macula_bootstrap` `discoverers` wired to a stub tier (an empty
-  `outbound_peers` halts the boot with `{error, no_tiers}`), and a long-lived
-  guardian process to own the supervisor link, because `peer:call` runs in a
-  transient process whose exit would take the supervisor with it.
-
-Reimplementing that in `macula-e2e` is ~700 lines and is precisely the "two
-copies of one judgement" pattern we are deleting elsewhere. The second copy
-would also rot silently, because nothing would tell it when the station's boot
+Step 1 could not be written at all while **no repo except `macula-station` could
+spawn a station**: `macula_station_test_cluster` and `macula_station_stub_tier`
+lived in `apps/macula_station/test/`, rebar3 does not compile a dependency's
+`test/` directory, and macula-station is not on hex, so a git dep did not help
+either. Hand-rolling a station boot in this repo would have been ~700 lines and a
+second copy of one judgement, rotting silently the moment the station's boot
 contract changed.
 
-**The fix belongs in `macula-station`:** promote the harness out of
-`apps/macula_station/test/` into a shipped app in the umbrella, so any git-dep
-consumer gets it on the code path. That is defensible on its own merits once a
-second repo needs to spawn a station, which is now.
+**It was fixed where it belonged.** `macula-station` now ships
+`apps/macula_station_harness`, holding both modules, so any consumer gets them on
+its code path. This repo depends on it by `git_subdir` at an exact sha.
 
-This blocks step 1 only. Everything downstream of it (sections 2 to 5) is
-unaffected and stands as designed.
+### ⚠ On the git dependencies
+
+They are pinned to **exact shas, never branches**, which is a scoped exception:
+the rule against a committed git dependency on `macula` exists so that a LIBRARY
+never ships one, and this repo publishes to no registry. An earlier pin here
+named a branch that has since been merged away, so it resolved on one machine and
+on no other, and a fresh clone failed in a way that read as a broken repo rather
+than a stale pin. **A sha goes stale silently; a branch goes stale loudly and
+later.** Neither is caught by anything automatic here on purpose: a check that the
+pin is current would go red on every upstream push and be switched off within a
+week. **Instead the suite prints the versions it built against in its run output,
+so a green run always names what it actually tested.**
