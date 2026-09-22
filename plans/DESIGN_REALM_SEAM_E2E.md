@@ -1,3 +1,10 @@
+> ⚠ **REVIEWED AND BEING CORRECTED.** Venus reviewed this against the trees and
+> found five things wrong with it. I agreed with all five; two were mistakes in
+> my reasoning rather than missing detail. Venus is amending this document in
+> place, so what you read below is current rather than a record of who thought
+> what. The five, and why they were wrong, are in the message of the commit that
+> added this note. Remove this note once the amendment lands.
+
 # DESIGN: the realm-seam E2E gate
 
 > **This exists so that a BEAM client can call mcl-echo through a real station,
