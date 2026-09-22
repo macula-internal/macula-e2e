@@ -97,7 +97,7 @@ The order is therefore fixed and is not a matter of taste:
                                  Do not trust the load. See 3b.
 8. realm issues the chain     -> org_directory (realm-signed)
                                  + procedure_delegation (org-signed, names
-                                   mcl-echo's node id)
+                                   mcl-echo's node id). NOT a call: see 3f.
 9. boot mcl-echo on mcl_om    -> it resolves the chain and advertises
 10. client pool calls echo    -> send a FRESH random value, assert the reply
                                  carries exactly it, read at its key (2)
@@ -223,6 +223,43 @@ rather than generating one, since an unground node_id is refused with
 (`-define(PUZZLE_DIFFICULTY, 8)` in `macula_node_keys`, and the harness pins the
 same 8); about 72 ms of grinding. The raise to 12 is pending and is not this
 gate's business.
+
+### ⛔ 3f. Step 8 is a COMMAND, not a call, and it is blocked
+
+`MaculaRealm.Mesh.ProviderAuthorization.issue/2` **dispatches a command**
+through `GuideRealmLifecycle`, event-sourced, and a process manager does the
+signing and the DHT writes off the emitted event.
+
+⚠ **So `:ok` from `issue/2` means the command was ACCEPTED, not that the records
+exist.** Assert on the station's DHT, read back with a bounded wait, exactly as
+step 4 does for the trust list. Asserting on the return value asserts that a step
+ran, which is the one thing this document exists to forbid, and the wait is not
+an inconvenience to be optimised away later: it is the difference between
+measuring the artefact and measuring the dispatch.
+
+⛔ **BLOCKED on a bootable, configured realm, which is not this suite's to
+build.** The realm needs more than a module on a code path: the application does
+not start on a bare peer. Measured 2026-09-23, first thing it says:
+
+    Exqlite.Connection failed to connect: You must provide a :database
+    to the database
+
+so it wants its SQLite read models configured, and behind them its ReckonDB
+side. That is realm knowledge rather than seam knowledge and belongs with the
+realm's owner, who needs a bootable realm for their own tests anyway. **Steps 8
+to 10 wait for it.** The existing realm case in this suite gets away with a bare
+peer only because `RealmSigningKey.key_id/0` is a plain function.
+
+### ⚠ 3g. Step 9: mcl-echo comes in as a pinned git dependency
+
+mcl-echo is not a dependency of this repo and has no route into it. It enters as
+a **git dependency pinned to an exact sha, never a branch**, under the same
+scoped exception as the station's apps: this repo publishes to no registry, so
+the rule that keeps a LIBRARY from shipping a git dependency does not apply.
+
+⚠ **The cost, worth knowing now rather than discovering it in CI: mcl-echo is a
+PRIVATE repository.** The day this suite runs in CI, that fetch needs
+credentials. It is a real step and it is nobody's yet.
 
 ## 4. The breaks this gate must fail on
 
