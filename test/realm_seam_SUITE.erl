@@ -23,24 +23,31 @@
 %%% If a self-hosted IPv6 runner ever lands, reason 2 still stands. DO
 %%% NOT point this suite at the real mesh.
 %%%
-%%% == ⚠ RED ON ARRIVAL, and it is the harness, not the suite ==
+%%% == What this suite covers, and what it waits for ==
 %%%
-%%% A station spawned by `macula_station_test_cluster' fails with `undef'
-%%% on `macula_quic:listen/3'. That reads as a version mismatch and is
-%%% not one: `listen/3' exists in both 11.5.0 and 12. The module is not
-%%% loaded AT ALL, because its `on_load' cannot find the NIF, and every
-%%% function of such a module answers `undef'. The peer says so itself:
+%%% GREEN as it stands, against `macula_station_harness' at
+%%% `1c33572112b9'. The four cases here are steps 0 to 7 of the
+%%% ordering: the profile and puzzle mode, a station that serves its own
+%%% endpoint record, a trust list that makes the realm checkable, and a
+%%% realm that loads the key we published.
 %%%
-%%%   NIF load failed: '<project root>/priv/macula_quic.so:
-%%%     cannot open shared object file'
+%%% ⛔ Steps 8 to 10 are NOT here and are blocked, not forgotten. Step 8
+%%% needs a bootable, configured realm: `issue/2' dispatches a COMMAND
+%%% and a process manager does the signing and the DHT writes, so it
+%%% needs the realm running rather than a module on a code path, and
+%%% `macula_realm' does not start on a bare peer. Step 9 needs mcl-echo
+%%% as a dependency. Both are recorded in the design with their reasons.
 %%%
-%%% On the peer, `code:priv_dir(macula)' resolves to the PROJECT ROOT's
-%%% `priv' rather than the build tree's. The library is present, and it
-%%% loads on the node that spawns the peer. Routed to macula-station:
-%%% the spawned node has to be able to resolve macula's application
-%%% directory before anything touches a macula module.
-%%%
-%%% Until that lands, every case here that spawns a station is red.
+%%% ⚠ It was red for a day on a harness defect, and the shape is worth
+%%% keeping even though the defect is gone: a spawned station failed
+%%% with `undef' on `macula_quic:listen/3', which reads as a version
+%%% mismatch and was not one. The module was not loaded AT ALL, because
+%%% its `on_load' could not find the NIF, and every function of such a
+%%% module answers `undef'. `code:which/1' named the right beam on the
+%%% same node in the same breath, because `which' resolves a MODULE and
+%%% `lib_dir' resolves an APPLICATION by a path entry's basename. If a
+%%% spawned node here ever reports `undef' for something that plainly
+%%% exists, ask it for `code:priv_dir(macula)' before anything else.
 %%%
 %%% == ⚠ Two local traps that cost an hour, in case they cost you one ==
 %%%
