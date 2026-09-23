@@ -86,13 +86,33 @@
 %% handshake while looking green. See 3e.
 -define(PUZZLE_ENFORCEMENT, enforce).
 
+%% The realm's name, and therefore its id: `macula_realm:id/1' is sha256 over
+%% the canonical NAME, so an invented 32-byte realm id is the hash of nothing
+%% and nothing issued under it verifies against anything.
+-define(REALM_NAME, <<"io.macula">>).
+
+%% The org the delegation is issued for. One value, named here, because both
+%% the directory key and the realm's own dispatch take it and two spellings
+%% would produce two chains that each look fine alone.
+-define(ORG, <<"seam-org">>).
+
+%% Step 8 crosses a command dispatch, a process manager, a signature and a DHT
+%% write before anything is readable, so it is not the sub-second wait the
+%% trust list is.
+-define(CHAIN_WAIT_MS, 30_000).
+
+%% Founding is a 5-second retry loop against the event store coming up, so the
+%% wait for it is its own budget and is not the chain's.
+-define(INITIATION_WAIT_MS, 60_000).
+
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 
 -export([the_station_runs_the_profile_and_puzzle_mode_this_seam_names/1,
          a_spawned_station_serves_its_own_endpoint_record/1,
          a_published_trust_list_makes_the_realm_checkable/1,
-         the_realm_loads_the_signing_key_we_published/1]).
+         the_realm_loads_the_signing_key_we_published/1,
+         the_realm_issues_a_chain_the_station_can_read/1]).
 
 %% Run on the station's peer node.
 -export([on_station_trust_pairs/0]).
@@ -103,13 +123,25 @@ all() ->
     [the_station_runs_the_profile_and_puzzle_mode_this_seam_names,
      a_spawned_station_serves_its_own_endpoint_record,
      a_published_trust_list_makes_the_realm_checkable,
-     the_realm_loads_the_signing_key_we_published].
+     the_realm_loads_the_signing_key_we_published,
+     the_realm_issues_a_chain_the_station_can_read].
 
 init_per_suite(Config) ->
+    ok = realm_supported_otp(erlang:system_info(otp_release)),
     true = absolute_code_path(),
     ok = driver_identity_under(?config(priv_dir, Config)),
     {ok, _} = application:ensure_all_started(macula),
     Config.
+
+%% ⛔ The realm peer runs on the DRIVER's runtime, and the realm does not run on
+%% OTP 29: horus 0.3.1, under its event store, crashes there, a projector dies,
+%% and the case fails 60 seconds later as `not_initiated' with nothing pointing
+%% at the runtime. Refuse up front and name both versions. The realm pins its
+%% toolchain in its own `.tool-versions'; put that OTP first on PATH.
+realm_supported_otp("28") ->
+    ok;
+realm_supported_otp(Release) ->
+    {error, {realm_needs_otp_28, {driver_otp, Release}}}.
 
 %% ⛔ Give the DRIVER its own node identity file, before `macula' starts.
 %%
@@ -316,8 +348,151 @@ the_realm_loads_the_signing_key_we_published(Config) ->
     end.
 
 %%====================================================================
+%% Step 8: the realm issues the chain, and the STATION holds it
+%%====================================================================
+
+%% @doc The realm issues a provider's delegation and the chain lands in
+%% the station's DHT: `org_directory' under our realm, and a
+%% `procedure_delegation' naming the provider.
+%%
+%% ⛔ `ProviderAuthorization.issue/2' DISPATCHES A COMMAND. `:ok' means
+%% the command was accepted, not that anything was signed or written: a
+%% process manager does the signing and the DHT writes off the emitted
+%% event. So asserting on its return value asserts that a step ran, which
+%% is the one thing this suite exists to forbid.
+%%
+%% ⛔ AND THE WAIT READS THE STATION, NOT THE REALM. A predicate over the
+%% realm's own projections says the realm BELIEVES it published, which is
+%% `issue/2''s return wearing a different hat. That is not hypothetical:
+%% the fleet has run the live version of it, a station roll wiping the
+%% realm-published `org_directory' chain while the realm stayed healthy
+%% and believed everything was published, with services down for up to
+%% two hours. A gate that asks the realm cannot see that.
+%%
+%% ⚠ The realm id is `macula_realm:id(Name)', sha256 over the canonical
+%% realm NAME, and not an arbitrary 32 bytes. An invented id is the hash
+%% of nothing: the trust list would pin a realm the chain is not issued
+%% under, and every record here would verify against nobody.
+the_realm_issues_a_chain_the_station_can_read(Config) ->
+    Opts = ?config(cluster_opts, Config),
+    Foundation = mint_foundation_key(),
+    RealmKey = mint_realm_signing_key(),
+    RealmId = macula_realm:id(?REALM_NAME),
+    Provider = mint_provider_node_id(),
+    [B] = spawn_station(Opts, Foundation),
+    try
+        ok = publish_trust_list(B, Foundation, RealmId, RealmKey),
+        ?assertEqual(macula_node_keys:key_id(RealmKey),
+                     trusted_key_id_for(B, RealmId)),
+
+        Realm = start_configured_realm(B, RealmKey, Config),
+        try
+            ok = issue_once_initiated(Realm, Provider),
+
+            %% Artefact one: the org directory, read out of the STATION.
+            [Dir] = dht_record(B, macula_record:org_directory_key(RealmId, ?ORG)),
+            #{realm_id := DirRealm, org_key := OrgKey} =
+                macula_record:read_org_directory(Dir),
+            ?assertEqual(RealmId, DirRealm),
+
+            %% Artefact two: the delegation, keyed by the ORG key the
+            %% directory just named, and naming THIS provider. Taking the
+            %% org key from the directory rather than guessing it is what
+            %% makes the two records one chain rather than two facts.
+            [Del] = dht_record(B, macula_record:procedure_delegation_key(OrgKey, Provider)),
+            ?assertEqual(#{org_key => OrgKey, advertiser => Provider},
+                         macula_record:read_procedure_delegation(Del))
+        after
+            peer:stop(Realm)
+        end
+    after
+        macula_station_test_cluster:stop_cluster([B])
+    end.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
+
+%% A record out of the station's own DHT, waited for rather than slept on.
+%%
+%% ⚠ `find_local_record/2' returns a LIST, and an empty one is exactly what
+%% a station holding nothing gives. The caller matches `[Rec]`, so a wait
+%% that gave up returns `[]` and the case fails on the artefact rather than
+%% on a timeout that says nothing about what was missing.
+dht_record(B, Key) ->
+    dht_record(B, Key, erlang:monotonic_time(millisecond) + ?CHAIN_WAIT_MS).
+
+dht_record(B, Key, Deadline) ->
+    Found = macula_station_test_cluster:rpc(
+              B, macula_dht, find_local_record, [macula_dht, Key]),
+    chain_settled(Found, B, Key, Deadline).
+
+chain_settled([_ | _] = Found, _B, _Key, _Deadline) ->
+    Found;
+chain_settled([], B, Key, Deadline) ->
+    chain_time_left(erlang:monotonic_time(millisecond) < Deadline, B, Key, Deadline).
+
+chain_time_left(false, _B, _Key, _Deadline) ->
+    [];
+chain_time_left(true, B, Key, Deadline) ->
+    timer:sleep(200),
+    dht_record(B, Key, Deadline).
+
+%% A realm booted the way a realm actually boots: read models created and
+%% migrated, its ReckonDB side up, applications started in the order it
+%% needs. `MaculaRealm.Testing' is the realm's own, so this suite does not
+%% carry realm knowledge it would get wrong.
+%%
+%% ⚠ The seeds are PINNED. `MaculaRealm.Mesh` derives its seed list once at
+%% `init/1` and refuses an unpinned list outright (D5), so the station has
+%% to exist before the realm application starts and its ephemeral port is
+%% only knowable after it bound one.
+start_configured_realm(B, RealmKey, Config) ->
+    KeyPath = filename:join(?config(priv_dir, Config), "realm-key.pq.bin"),
+    ok = save_realm_key(KeyPath, RealmKey),
+    DataDir = filename:join(?config(priv_dir, Config), "realm-data"),
+    {Ip, Port} = macula_station_test_cluster:listen_addr(B),
+    Seeds = [#{host => iolist_to_binary(inet:ntoa(Ip)), port => Port,
+               expected_node_id => macula_station_test_cluster:pubkey(B)}],
+    {ok, Peer, _Node} = peer:start(
+                          #{name => peer:random_name(realm_seam_chain),
+                            connection => standard_io,
+                            args => ["-pa" | realm_code_path()]}),
+    %% The realm FOUNDS ITSELF through its own boot path: `MaculaRealm.Testing'
+    %% turns on `ensure_realm_initiated', gives it a `secret_key_base' to seal
+    %% K_realm with, connects it to the mesh and starts every release app but
+    %% the web one. The realm signs with the key this suite minted, so the
+    %% chain can be checked against it.
+    {ok, _} = peer:call(Peer, 'Elixir.MaculaRealm.Testing', start,
+                        [[{data_dir, DataDir}, {seeds, Seeds},
+                          {profile, profile()}, {realm, ?REALM_NAME},
+                          {realm_key_path, KeyPath}]], 120_000),
+    ok = peer:call(Peer, 'Elixir.MaculaRealm.Testing', await_ready,
+                   [[{timeout_ms, 60_000}]], 90_000),
+    Peer.
+
+%% Issue the delegation once the realm has finished FOUNDING ITSELF.
+%%
+%% ⚠ A realm that has booted is not yet a realm that has a realm: until its
+%% realm row exists, every `admit_and_issue/3' comes back
+%% `{error, realm_not_initiated}'. `await_ready/1' answers about a connected
+%% link and a loaded signing key and does not cover founding, correctly, so
+%% the realm's own `await_initiated/1' is waited on as a separate state. The
+%% wait is on the PRECONDITION, never on the artefact: the chain records are
+%% still read once, out of the station, by `dht_record/2'.
+issue_once_initiated(Realm, Provider) ->
+    ok = peer:call(Realm, 'Elixir.MaculaRealm.Testing', await_initiated,
+                   [[{timeout_ms, ?INITIATION_WAIT_MS}]], ?INITIATION_WAIT_MS + 30_000),
+    peer:call(Realm, 'Elixir.MaculaRealm.Mesh.ProviderAuthorization',
+              admit_and_issue, [?ORG, Provider, <<"seam">>], 60_000).
+
+%% The provider whose delegation the realm issues. A node id and nothing
+%% else: step 8 is about the chain reaching the station, and mcl-echo does
+%% not have to exist for the realm to name it.
+mint_provider_node_id() ->
+    {ok, K} = macula_node_keys:generate(identity, profile(), #{puzzle_difficulty => 0}),
+    {ok, NodeId} = macula_node_keys:node_id(K),
+    NodeId.
 
 %% ⚠ 0600. `macula_node_keys:load/3' gates on `owner_only_read', which is
 %% `Mode band 8#077 =:= 0'. A key file with default permissions is refused,
@@ -360,8 +535,11 @@ start_realm_node(KeyPath) ->
 realm_code_path() ->
     Build = os:getenv("MACULA_REALM_BUILD",
                       "/home/rl/work/github.com/macula-io/macula-realm/_build/test/lib"),
+    %% The Elixir the realm is BUILT with (its `.tool-versions'), not whatever
+    %% `elixir' is first on PATH: realm beams on another Elixir's stdlib is a
+    %% skew nothing reports.
     Elixir = os:getenv("ELIXIR_LIB",
-                       "/home/rl/.local/share/mise/installs/elixir/1.20.4-otp-28/lib"),
+                       "/home/rl/.local/share/mise/installs/elixir/1.18.4-otp-28/lib"),
     filelib:wildcard(filename:join(Build, "*/ebin"))
         ++ filelib:wildcard(filename:join(Elixir, "*/ebin")).
 
