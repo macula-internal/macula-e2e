@@ -107,8 +107,28 @@ all() ->
 
 init_per_suite(Config) ->
     true = absolute_code_path(),
+    ok = driver_identity_under(?config(priv_dir, Config)),
     {ok, _} = application:ensure_all_started(macula),
     Config.
+
+%% ⛔ Give the DRIVER its own node identity file, before `macula' starts.
+%%
+%% macula 12 gives a node ONE stored identity: a pool started without one loads,
+%% and WRITES when absent, `filename:basedir(user_data, "macula")/identity.key'.
+%% That is correct for an operator and wrong for a test run, which would read and
+%% write the identity of whoever is running it, and carry it between runs.
+%%
+%% ⚠ It does not present as a path problem. A file left there by something else
+%% under another profile surfaces as `{badmatch, {error, {wrong_profile, pq_pure}}}'
+%% out of `macula:connect/2', which reads as a bug in this suite and is a file from
+%% somewhere else. Neptunus met it porting the station.
+%%
+%% The SPAWNED stations are already safe: `macula_station_test_cluster' sets
+%% `node_identity_path' to each station's own data dir. Only the driver was left
+%% on the default, because it is the one node the harness does not create.
+driver_identity_under(PrivDir) ->
+    application:set_env(macula, node_identity_path,
+                        filename:join(PrivDir, "driver_identity.key")).
 
 %% ⚠ Make every code path entry absolute before any station is spawned.
 %%
@@ -327,6 +347,16 @@ start_realm_node(KeyPath) ->
 %% macula-realm is a mix project and is not a rebar3 dependency of anything
 %% here, so its tree is located rather than depended on. `MACULA_REALM_BUILD'
 %% overrides for a checkout somewhere else.
+%%
+%% ⛔ THAT TREE MUST BE BUILT AGAINST THE SAME `macula' AS THIS SUITE, and
+%% nothing checks it. A realm built against 11.x cannot read a key file this
+%% suite writes with 12, so `macula_node_keys:load/3' refuses, RealmSigningKey
+%% DISCARDS the error, and the realm holds a silently different key. That shows
+%% up as `the_realm_loads_the_signing_key_we_published' failing on two key ids
+%% that look like nothing in particular, with no hint that the cause is a
+%% version skew in a directory this file names by default. Measured 2026-09-23:
+%% against macula-realm main (11.4.0) that case fails and the other three pass;
+%% against the ported tree all four pass.
 realm_code_path() ->
     Build = os:getenv("MACULA_REALM_BUILD",
                       "/home/rl/work/github.com/macula-io/macula-realm/_build/test/lib"),
