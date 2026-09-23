@@ -237,6 +237,18 @@ ran, which is the one thing this document exists to forbid, and the wait is not
 an inconvenience to be optimised away later: it is the difference between
 measuring the artefact and measuring the dispatch.
 
+⛔ **The same argument rules out a readiness predicate on the REALM's side, and
+it was offered.** A check against the realm's own projections reports that the
+realm BELIEVES it published, which is `issue/2`'s return wearing a different hat.
+The predicate has to read the station, so that **a realm which believes it
+published while the station holds nothing FAILS**.
+
+That is not a hypothetical. The fleet has run the live version of it: a station
+roll wiped the realm-published `org_directory` chain, and every service whose
+advertise path needed it was down for up to two hours while the realm was
+healthy and believed everything was published. A gate that asks the realm cannot
+see that. A gate that reads the station sees it immediately.
+
 ⛔ **BLOCKED on a bootable, configured realm, which is not this suite's to
 build.** The realm needs more than a module on a code path: the application does
 not start on a bare peer. Measured 2026-09-23, first thing it says:
