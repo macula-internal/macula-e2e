@@ -54,6 +54,23 @@ MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433" \
 
 `MACULA_E2E_BOOTSTRAP` is required; there is no default seed.
 
+### Seam suite (station and realm, no fleet)
+
+`seam/realm_seam_SUITE` spawns real stations and a real realm on local
+`peer` nodes. It needs the macula-station apps, which come from a private
+repository, so they live only in the `seam` profile. The default profile,
+lint and the published image never fetch them.
+
+```bash
+MACULA_REALM_BUILD=/path/to/macula-realm/_build/test/lib \
+  rebar3 as seam ct --suite seam/realm_seam_SUITE
+```
+
+It needs read access to macula-station, OTP 28 first on `PATH` (the realm
+does not run on OTP 29, and the suite refuses to start there), and a
+macula-realm tree built with `mix test` under the realm's own
+`.tool-versions`. `ELIXIR_LIB` defaults to that Elixir's `lib`.
+
 ### Container
 
 ```bash
