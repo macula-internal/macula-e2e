@@ -143,24 +143,19 @@ realm_supported_otp("28") ->
 realm_supported_otp(Release) ->
     {error, {realm_needs_otp_28, {driver_otp, Release}}}.
 
-%% ⛔ Give the DRIVER its own node identity file, before `macula' starts.
+%% ⛔ Give the DRIVER its own identity directory, before `macula' starts.
 %%
-%% macula 12 gives a node ONE stored identity: a pool started without one loads,
-%% and WRITES when absent, `filename:basedir(user_data, "macula")/identity.key'.
+%% macula stores a node identity per user account: a pool started without a key
+%% loads, and WRITES when absent, `<identity_dir>/default.<profile>.key', and
+%% `identity_dir' defaults to the platform's per-user data directory (macula#76).
 %% That is correct for an operator and wrong for a test run, which would read and
 %% write the identity of whoever is running it, and carry it between runs.
 %%
-%% ⚠ It does not present as a path problem. A file left there by something else
-%% under another profile surfaces as `{badmatch, {error, {wrong_profile, pq_pure}}}'
-%% out of `macula:connect/2', which reads as a bug in this suite and is a file from
-%% somewhere else. Neptunus met it porting the station.
-%%
 %% The SPAWNED stations are already safe: `macula_station_test_cluster' sets
-%% `node_identity_path' to each station's own data dir. Only the driver was left
-%% on the default, because it is the one node the harness does not create.
+%% `identity_dir' to each station's own data dir. Only the driver was left on the
+%% default, because it is the one node the harness does not create.
 driver_identity_under(PrivDir) ->
-    application:set_env(macula, node_identity_path,
-                        filename:join(PrivDir, "driver_identity.key")).
+    application:set_env(macula, identity_dir, filename:join(PrivDir, "driver_identity")).
 
 %% ⚠ Make every code path entry absolute before any station is spawned.
 %%
