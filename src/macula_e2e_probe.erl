@@ -335,10 +335,12 @@ classify_chunked_put({ok, MCID}, ReaderPool, Bytes) ->
 classify_chunked_put({error, _} = E, _ReaderPool, _Bytes) ->
     E.
 
-%% A put that took the manifest path names a manifest MCID. A single-block
-%% MCID (codec `16#55') means the chunked path never ran.
-chunked_mcid(<<1, 16#56, _/binary>> = MCID) -> {ok, MCID};
-chunked_mcid(MCID)                          -> {error, {not_chunked, MCID}}.
+%% A put that took the manifest path names a manifest MCID: SHA-384, tag 2,
+%% codec `16#56' (D24). A single-block MCID (codec `16#55') means the chunked
+%% path never ran. Tag 1 (BLAKE3) is not a content id since macula 11, so it
+%% never passes.
+chunked_mcid(<<2, 16#56, _:48/binary>> = MCID) -> {ok, MCID};
+chunked_mcid(MCID)                             -> {error, {not_chunked, MCID}}.
 
 fetch_chunked_content({ok, MCID}, ReaderPool, Bytes) ->
     classify_get_content(macula:get_content(ReaderPool, MCID), Bytes);

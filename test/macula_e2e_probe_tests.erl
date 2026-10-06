@@ -61,12 +61,12 @@ missing_events_are_named_by_sender_and_message_test() ->
                           missing_pairs, [{1, 2}, {2, 1}]}},
                  ?M:drain_pubsub_tokens(Ref, Expected, 50)).
 
-%% An 8 KiB put mints a single-block MCID (codec 16#55), the same way
-%% macula_content_transfer does. The chunked probe must refuse it rather
+%% An 8 KiB put mints a single-block MCID (SHA-384, codec 16#55), the same
+%% way macula_content_store does. The chunked probe must refuse it rather
 %% than pass on a round-trip that never chunked.
 single_block_mcid_is_not_chunked_test() ->
     Bytes = crypto:strong_rand_bytes(8192),
-    Mcid = <<1, 16#55, (macula_blake3_nif:hash(Bytes))/binary>>,
+    Mcid = <<2, 16#55, (crypto:hash(sha384, Bytes))/binary>>,
     ?assertEqual({error, {not_chunked, Mcid}}, ?M:chunked_mcid(Mcid)).
 
 %% The chunked probe's blob, three full chunks and a partial one at the
