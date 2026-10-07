@@ -20,7 +20,8 @@
 
 %% A closed local port: the pool never gets a healthy link, and the SDK has
 %% no fallback seeds, so nothing here reaches the fleet.
--define(DEAD_SEED, <<"https://127.0.0.1:9">>).
+%% Every seed names the node it expects (macula 12): a synthetic one here.
+-define(DEAD_SEED, #{host => <<"127.0.0.1">>, port => 9, expected_node_id => <<9:256>>}).
 
 %% Every publish on a pool without a healthy link returns
 %% {error, {transient, no_healthy_station}}. That must come back as

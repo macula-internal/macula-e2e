@@ -23,9 +23,21 @@ jobs:
       - name: Elvis
         run: rebar3 as lint lint
 
+  # The offline probe checks. They start macula, which needs ML-DSA from
+  # libcrypto (a stock runner has none) and its NIFs built with Rust, so they
+  # run in the team's pinned OTP image, the one macula's own CI uses.
+  eunit:
+    runs-on: ubuntu-latest
+    container: ghcr.io/macula-io/macula-ci-otp:20260923-1352@sha256:aff1d39bc4aa29d13044b90b38e9b7f4b757d50818cc11c5bb7e84cdbf82ac70
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: eunit
+        run: rebar3 eunit
+
   image:
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [lint, eunit]
     permissions:
       contents: read
       packages: write
