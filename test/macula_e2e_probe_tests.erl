@@ -23,25 +23,23 @@
 %% Every seed names the node it expects (macula 12): a synthetic one here.
 -define(DEAD_SEED, #{host => <<"127.0.0.1">>, port => 9, expected_node_id => <<9:256>>}).
 
-%% Every publish on a pool without a healthy link returns
-%% {error, {transient, no_healthy_station}}. That must come back as
-%% publish_failed naming each refused publish, next to what the drain saw.
-refused_publish_is_reported_as_publish_failed_test_() ->
-    {timeout, 30, fun() ->
+%% Macula 15.6 made a subscription hold only once a station acknowledges
+%% it (macula#12). With no reachable station there is no acknowledgement,
+%% so subscribe/4 exits with a timeout instead of returning {ok, Ref} at
+%% once, which is the precondition the publish-refusal probe below used to
+%% stand on. This asserts the new contract rather than the old instant
+%% return; the refusal path itself needs a station to reach, which the
+%% fleet suite provides.
+a_subscription_is_never_acknowledged_without_a_station_test_() ->
+    {timeout, 60, fun() ->
         {ok, _} = application:ensure_all_started(macula),
         {ok, Dead} = macula:connect([?DEAD_SEED], #{}),
-        Result = ?M:multi_publisher_pubsub(1, 2, Dead, Dead,
-                                           macula_realm:id(<<"_test">>),
-                                           <<"e2e.probe.refused">>),
-        macula:close(Dead),
-        Refused = {error, {transient, no_healthy_station}},
-        ?assertEqual({error, {publish_failed,
-                              [{1, 1, Refused}, {1, 2, Refused}],
-                              drained,
-                              {error, {missing_pubsub_events,
-                                       missing, 2, received_unique, 0,
-                                       missing_pairs, [{1, 1}, {1, 2}]}}}},
-                     Result)
+        %% It waits out the acknowledgement window and then says so:
+        %% {unacknowledged, _}, not a hang and not {ok, Ref}.
+        ?assertMatch({error, {unacknowledged, _}},
+                     macula:subscribe(Dead, macula_realm:id(<<"_test">>),
+                                      <<"e2e.probe.refused">>, self())),
+        macula:close(Dead)
     end}.
 
 %% Two of four events arrive, one of them twice, plus a payload with no
