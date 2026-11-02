@@ -199,21 +199,21 @@ connect_fleet(Bootstrap, BootstrapOther, Config) ->
     %% Explicit puzzle-hardened identities, the kind macula generates by
     %% default, so each pool's node id is known: the RPC probes assert the
     %% `caller' a handler sees is the pool that called.
-    PoolKp  = macula_identity:generate(#{puzzle => true}),
-    OtherKp = macula_identity:generate(#{puzzle => true}),
-    CrossKp = macula_identity:generate(#{puzzle => true}),
-    {ok, Pool}  = macula:connect(Bootstrap, #{identity => PoolKp}),
-    {ok, Other} = macula:connect(Bootstrap, #{identity => OtherKp}),
+    PoolKp  = macula_e2e_keys:new(#{puzzle => true}),
+    OtherKp = macula_e2e_keys:new(#{puzzle => true}),
+    CrossKp = macula_e2e_keys:new(#{puzzle => true}),
+    {ok, Pool}  = macula:connect(Bootstrap, #{node_identity => PoolKp}),
+    {ok, Other} = macula:connect(Bootstrap, #{node_identity => OtherKp}),
     {CrossOpt, CrossPools} =
         case BootstrapOther of
             undefined -> {undefined, []};
             _ ->
-                {ok, X} = macula:connect(BootstrapOther, #{identity => CrossKp}),
+                {ok, X} = macula:connect(BootstrapOther, #{node_identity => CrossKp}),
                 {X, [X]}
         end,
-    NodeIds = [{pool_node_id,  macula_identity:public(PoolKp)},
-               {other_node_id, macula_identity:public(OtherKp)},
-               {cross_node_id, macula_identity:public(CrossKp)}],
+    NodeIds = [{pool_node_id,  macula_e2e_keys:node_id(PoolKp)},
+               {other_node_id, macula_e2e_keys:node_id(OtherKp)},
+               {cross_node_id, macula_e2e_keys:node_id(CrossKp)}],
     %% macula:connect/2 spawns gen_servers linked to the caller. CT's
     %% init_per_suite controller exits with Config as its reason after
     %% returning, killing the linked pools before any test case runs.
@@ -457,11 +457,18 @@ cross_station_many_concurrent_calls(Config) ->
 -define(PAGE_SIZES, [9132, 15360, 15360, 21504, 29696, 45056, 64512, 131072]).
 -define(PAGE_DEADLINE_MS, 5_000).
 
+%% macula 16 refuses to advertise a procedure with no namespace
+%% (`{error, {provider_authorization, no_org_namespace}}'), and an org
+%% namespace then needs a realm-signed org directory and delegation. A
+%% procedure that carries NO namespace is written `_/<name>'
+%% (`macula_record:org_of/1': `org_of([<<"_">>, _Rest]) -> none'), which is
+%% what a transport probe wants: it is testing bytes on the wire, not the
+%% realm's trust chain.
 page_burst(Config) ->
     Server = ?config(pool, Config),
     Caller = ?config(other, Config),
     Realm = ?config(test_realm, Config),
-    Procedure = unique_topic(<<"e2e.page.burst">>),
+    Procedure = own_procedure(Config, <<"e2e.page.burst">>),
     expect_ok(macula_e2e_probe:page_burst(
                 Server, Caller, Realm, Procedure,
                 ?PAGE_SIZES, ?PAGE_DEADLINE_MS)).
@@ -469,11 +476,14 @@ page_burst(Config) ->
 cross_station_page_burst(Config) ->
     cross_or_skip(Config, fun(Server, Caller) ->
         Realm = ?config(test_realm, Config),
-        Procedure = unique_topic(<<"e2e.cross.page.burst">>),
+        Procedure = own_procedure(Config, <<"e2e.cross.page.burst">>),
         expect_ok(macula_e2e_probe:cross_station_page_burst(
                     Server, Caller, Realm, Procedure,
                     ?PAGE_SIZES, ?PAGE_DEADLINE_MS))
     end).
+
+own_procedure(_Config, Name) ->
+    <<"_/", (unique_topic(Name))/binary>>.
 
 many_concurrent_streams(Config) ->
     Server = ?config(pool, Config),
@@ -741,9 +751,44 @@ bootstrap_seeds_other() ->
 
 parse_seeds(false, Default) -> Default;
 parse_seeds(Env,   _Default) ->
-    [list_to_binary(string:trim(U))
-     || U <- string:split(Env, ",", all),
-        string:trim(U) =/= ""].
+    [seed(U) || U <- string:split(Env, ",", all),
+                string:trim(U) =/= ""].
+
+%% macula 16 refuses a seed that does not name the node id it expects
+%% (`macula:connect/2': "Every seed names the node_id it expects, in the seed
+%% or in the `expected_node_id' option"), and a URL binary cannot carry one.
+%% A pinned seed is therefore `https://host:port#<64 hex node id>', parsed here
+%% into the map form macula wants. A bare URL is passed through unchanged on
+%% purpose: macula then answers `{error, {seeds, expected_node_id_required}}',
+%% which tells the operator what to add better than dropping it here would.
+%%
+%% Node ids are the stations' own, published in the mesh's station directory
+%% (mcl-stations/list_stations) and in macula-fleet's release-targets.
+seed(Entry) ->
+    case string:split(string:trim(Entry), "#", trailing) of
+        [Url, NodeIdHex] -> pinned_seed(Url, NodeIdHex);
+        [Url]            -> list_to_binary(Url)
+    end.
+
+pinned_seed(Url, NodeIdHex) ->
+    {Host, Port} = split_host_port(Url),
+    #{host            => Host,
+      port            => Port,
+      expected_node_id => binary:decode_hex(
+                            list_to_binary(string:trim(NodeIdHex)))}.
+
+%% `https://host[:port]' or `host[:port]'. 4433 is the station QUIC port the
+%% fleet runs (macula-fleet's release-targets check lines use it).
+split_host_port(Url) ->
+    Bare = strip_scheme(string:trim(Url)),
+    case string:split(Bare, ":", trailing) of
+        [Host, Port] -> {list_to_binary(Host), list_to_integer(Port)};
+        [Host]       -> {list_to_binary(Host), 4433}
+    end.
+
+strip_scheme("https://" ++ Rest) -> Rest;
+strip_scheme("http://" ++ Rest)  -> Rest;
+strip_scheme(Other)              -> Other.
 
 wait_for_healthy([], _Remaining) ->
     ok;

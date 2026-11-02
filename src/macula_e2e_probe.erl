@@ -171,7 +171,7 @@ check_no_cross_realm(SubRef, PubPool, RealmA, Topic) ->
                 macula:procedure()) -> result().
 unary_rpc(ServerPool, CallerPool, CallerNodeId, Realm, Procedure) ->
     Handler = fun(Args) -> {ok, #{<<"got">> => Args}} end,
-    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{auth => open}),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Args = #{<<"x">> => 42},
     Reply = macula:call(CallerPool, Realm, Procedure, Args, 5_000),
@@ -256,8 +256,8 @@ on_recv({error, _} = E, _Stream, _Acc)    -> E.
 %% `?DHT_REPLICATION_MS' before the find.
 -spec dht_put_find(macula:pool(), macula:realm()) -> result().
 dht_put_find(Pool, Realm) ->
-    Identity = macula_identity:generate(),
-    NodeId = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId = macula_e2e_keys:node_id(Identity),
     Record = macula_record:node_record(NodeId, [Realm], 0,
                                        #{kind => <<"test_daemon">>}),
     Signed = macula_record:sign(Record, Identity),
@@ -529,7 +529,7 @@ extract_token(Payload) ->
                             macula:procedure()) -> result().
 many_concurrent_calls(NumCalls, ServerPool, CallerPool, Realm, Procedure) ->
     Handler = fun(Args) -> {ok, #{<<"echo">> => Args}} end,
-    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{auth => open}),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Parent = self(),
     Callers = [spawn_link(fun() ->
@@ -577,7 +577,7 @@ page_burst(ServerPool, CallerPool, Realm, Procedure, Sizes, DeadlineMs) ->
     Handler = fun(#{<<"bytes">> := N}) ->
                       {ok, #{<<"payload">> => binary:copy(<<"x">>, N)}}
               end,
-    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{auth => open}),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Result = fire_page(CallerPool, Realm, Procedure, Sizes, DeadlineMs),
     catch macula:unadvertise(ServerPool, Realm, Procedure),
@@ -777,8 +777,8 @@ cross_station_many_concurrent_dht_records(NumRecords, WriterPool,
 
 do_many_concurrent_dht_records(NumRecords, WriterPool, ReaderPool, Realm) ->
     Records = [begin
-        Identity = macula_identity:generate(),
-        NodeId   = macula_identity:public(Identity),
+        Identity = macula_e2e_keys:new(),
+        NodeId   = macula_e2e_keys:node_id(Identity),
         Record   = macula_record:node_record(NodeId, [Realm], 0,
                                              #{kind => <<"test_daemon">>}),
         Signed   = macula_record:sign(Record, Identity),
@@ -946,8 +946,8 @@ cross_station_tombstone_propagation(WriterPool, ReaderPool, Realm) ->
     do_tombstone_propagation(WriterPool, ReaderPool, Realm, 60_000).
 
 do_tombstone_propagation(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
-    Identity = macula_identity:generate(),
-    NodeId   = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId   = macula_e2e_keys:node_id(Identity),
     Record   = macula_record:node_record(NodeId, [Realm], 0,
                                          #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
@@ -1066,8 +1066,8 @@ do_subscribe_records(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
 subscribe_records_subscribed({ok, SubRef}, WriterPool, ReaderPool,
                              Realm, MaxWaitMs, Tag) ->
     timer:sleep(?SUBSCRIBE_SETTLE_MS),
-    Identity = macula_identity:generate(),
-    NodeId   = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId   = macula_e2e_keys:node_id(Identity),
     Record   = macula_record:node_record(NodeId, [Realm], 0,
                                          #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
@@ -1105,8 +1105,8 @@ await_record_callback(Tag, ExpectedKey, PutAt, TimeoutMs) ->
                                  ReaderPool :: macula:pool(),
                                  macula:realm()) -> result().
 cross_station_dht_put_find(WriterPool, ReaderPool, Realm) ->
-    Identity = macula_identity:generate(),
-    NodeId = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId = macula_e2e_keys:node_id(Identity),
     Record = macula_record:node_record(NodeId, [Realm], 0,
                                        #{kind => <<"test_daemon">>}),
     Signed = macula_record:sign(Record, Identity),
