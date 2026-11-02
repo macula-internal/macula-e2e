@@ -3,6 +3,19 @@ name: build
 on:
   push:
     branches: [main]
+    # A README does not change the image, and a build here pushes `:latest' —
+    # the tag every station watching this image rolls onto. Without this, a
+    # typo fix in a `.md` file redeploys the fleet for nothing. Pull requests
+    # are not filtered: the tree checks cost seconds and always run.
+    #
+    # ⛔ `scripts/**` is deliberately NOT ignored: the Dockerfile COPYs
+    # `scripts/run-once.sh' to /usr/local/bin and makes it the ENTRYPOINT, so
+    # ignoring that directory would merge a change to the entrypoint and ship
+    # no image. An operator-script edit rebuilding the image is a cost; a
+    # silent stale entrypoint on every box is not.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   # A branch had no check at all: a reviewer could only be told "it
   # compiles here", which is how a suite that could not run a single case
   # stayed green for a month (macula-internal/macula-e2e#1). The image job
@@ -40,29 +53,34 @@ jobs:
       - name: eunit
         run: rebar3 eunit
 
-  # ⛔ No xref job yet, and that is a measurement, not a preference.
-  #
-  # eunit cannot see the rot this harness suffered (macula-internal/
+  # ⛔ eunit cannot see the rot this harness suffered (macula-internal/
   # macula-e2e#1): Erlang resolves remote calls at run time, so sixteen calls
   # to `macula_identity' — a module macula deleted at 12 — compiled happily,
   # passed lint and eunit, and failed only when a case tried to run them.
-  # xref reads those calls before anything runs, so it is the right check.
+  # xref reads those calls before anything runs, which is why it is here.
   #
-  # But `rebar3 xref' exits 1 the moment it has anything to report: it gates.
-  # At ff6ead0 it reports 132 warnings — 17 calls to functions this tree does
-  # not define (`macula_identity:generate/0' and `macula_identity:public/1',
-  # gone since macula 12; `macula:put_content/2' and `macula:get_content/2',
-  # which macula 16 took a realm and became `share_content/3' and
-  # `get_content/3'; `macula_download:start_link_direct/5',
-  # `macula:get_content_station/5', `macula_direct_dial:
-  # resolve_content_provider/2'), in `macula_e2e_duel' and
-  # `macula_e2e_probe' — and 115 unused exports, which in an escript
-  # collection is noise but still fails the run. Every one pre-dates this
-  # branch. Repairing them is the rest of e2e#1's suite.
-  #
-  # Reddening main on pre-existing rot before that repair is an outage, not a
-  # check, and a job marked continue-on-error is theatre. So the job lands
-  # with the repair, in the commit that makes `rebar3 xref' green here.
+  # It gates, and it is meant to: `rebar3 xref' exits 1 on any finding. The
+  # tree was not clean when this job was first written — 132 findings at
+  # ff6ead0 — so it was withdrawn until the repair landed, rather than
+  # reddening main on rot that pre-dated it. What `rebar.config' runs is
+  # `undefined_function_calls' and `undefined_functions' only; its
+  # `xref_checks' entry says why `exports_not_used' is not one of them here.
+  xref:
+    runs-on: ubuntu-latest
+    container: ghcr.io/macula-io/macula-ci-otp:20260923-1352@sha256:aff1d39bc4aa29d13044b90b38e9b7f4b757d50818cc11c5bb7e84cdbf82ac70
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: xref
+        run: rebar3 xref
+
+      # `rebar3 xref' analyses the default profile and never sees `test/', so a
+      # suite calling a function that no longer exists passes all of the above
+      # and fails only when the case runs — the rot of e2e#1, in the one place
+      # CI cannot execute. The script compiles the test profile and analyses
+      # those beams; red-first is one call reverted to a removed arity.
+      - name: xref over the test beams
+        run: scripts/xref-test-beams.sh
 
   # ⛔ The live burst is NOT a CI job, deliberately. The stations are
   # AAAA-only and a GitHub-hosted runner has no IPv6 egress
@@ -76,7 +94,7 @@ jobs:
   image:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    needs: [lint, eunit]
+    needs: [lint, eunit, xref]
     permissions:
       contents: read
       packages: write

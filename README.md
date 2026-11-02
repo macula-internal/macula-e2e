@@ -60,17 +60,25 @@ mcl-stations' `list_stations`.
 
 ### What CI runs, and what it cannot
 
-CI runs `rebar3 as lint lint` and `rebar3 eunit`, both on hosted runners. It
-does not run the suite: the stations are AAAA-only, a hosted runner has no
-IPv6 egress, and this repository is public, so no self-hosted runner may take
-work from it either. It does not run `rebar3 xref` yet, though that is the
-check that catches what eunit cannot — a call to a module or function that no
-longer exists compiles and passes eunit, which is how sixteen calls to
-`macula_identity` survived a year of green builds
-(macula-internal/macula-e2e#1). `rebar3 xref` exits 1 on any warning, so the
-job would be red on rot that pre-dates the branch (132 warnings at ff6ead0);
-it lands with the repair of `macula_e2e_duel` and `macula_e2e_probe`, which
-is the rest of e2e#1's suite.
+CI runs `rebar3 as lint lint`, `rebar3 eunit` and `rebar3 xref`, all on
+hosted runners. It does not run the suite: the stations are AAAA-only, a
+hosted runner has no IPv6 egress, and this repository is public, so no
+self-hosted runner may take work from it either.
+
+`xref` is the check that catches what eunit cannot — a call to a module or
+function that no longer exists compiles and passes eunit, which is how
+sixteen calls to `macula_identity` survived a year of green builds
+(macula-internal/macula-e2e#1). It gates: `rebar3 xref` exits 1 on any
+finding, so the tree has to stay clean. It checks undefined calls only;
+`rebar.config`'s `xref_checks` entry says why `exports_not_used` is not one
+of them here.
+
+`rebar3 xref` reads the default profile and never sees `test/`, so the same
+job also runs [`scripts/xref-test-beams.sh`](scripts/xref-test-beams.sh): it
+compiles the test profile and analyses those beams, which is where a suite's
+call to a removed arity would otherwise hide. `seam/` is not covered — its
+dependencies are private, so every call there would read as undefined; it
+runs by hand where that source is readable.
 
 The live burst runs by hand, from a machine with IPv6 egress, with
 [`scripts/run-page-burst.sh`](scripts/run-page-burst.sh): before a portal

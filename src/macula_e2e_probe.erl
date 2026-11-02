@@ -45,16 +45,16 @@
     cross_station_many_concurrent_streams/5,
     many_concurrent_dht_records/3,
     cross_station_many_concurrent_dht_records/4,
-    many_concurrent_blobs/2,
-    cross_station_many_concurrent_blobs/3,
+    many_concurrent_blobs/3,
+    cross_station_many_concurrent_blobs/4,
     tombstone_propagation/2,
     cross_station_tombstone_propagation/3,
     subscribe_records_local/2,
     subscribe_records_cross_station/3,
-    put_get_content/1,
-    cross_station_put_content/2,
-    put_get_chunked_content/1,
-    cross_station_put_chunked_content/2,
+    put_get_content/2,
+    cross_station_put_content/3,
+    put_get_chunked_content/2,
+    cross_station_put_chunked_content/3,
     cross_station_dht_put_find/3,
     pubsub_mpong_shape/4,
     cross_station_pubsub_mpong_shape/4,
@@ -282,27 +282,27 @@ classify_find({error, _} = E, _Key) -> E.
 %% via `_content.put_block', fetches it back via `_content.get_block',
 %% asserts the bytes match. Single-station: writer and reader share
 %% the pool, so the blob lives on the station the daemon dialled.
--spec put_get_content(macula:pool()) -> result().
-put_get_content(Pool) ->
-    do_put_get_content(Pool, Pool).
+-spec put_get_content(macula:pool(), macula:realm()) -> result().
+put_get_content(Pool, Realm) ->
+    do_put_get_content(Pool, Pool, Realm).
 
 %% Cross-station variant — Writer puts on one station, Reader fetches
 %% from a different one. The reader's relay handles the local miss
 %% via `_content.get_block' iterative fetch (one hop to peer
 %% stations); the writer's eager-put landed the block on the writer's
 %% relay only, so the reader has to walk out one hop.
--spec cross_station_put_content(macula:pool(), macula:pool()) -> result().
-cross_station_put_content(WriterPool, ReaderPool) ->
-    do_put_get_content(WriterPool, ReaderPool).
+-spec cross_station_put_content(macula:pool(), macula:pool(), macula:realm()) -> result().
+cross_station_put_content(WriterPool, ReaderPool, Realm) ->
+    do_put_get_content(WriterPool, ReaderPool, Realm).
 
-do_put_get_content(WriterPool, ReaderPool) ->
+do_put_get_content(WriterPool, ReaderPool, Realm) ->
     Bytes = crypto:strong_rand_bytes(8192),
-    classify_put_content(macula:put_content(WriterPool, Bytes),
-                         ReaderPool, Bytes).
+    classify_put_content(macula:share_content(WriterPool, Realm, Bytes),
+                         ReaderPool, Realm, Bytes).
 
-classify_put_content({ok, MCID}, ReaderPool, Bytes) ->
-    classify_get_content(macula:get_content(ReaderPool, MCID), Bytes);
-classify_put_content({error, _} = E, _ReaderPool, _Bytes) ->
+classify_put_content({ok, MCID}, ReaderPool, Realm, Bytes) ->
+    classify_get_content(macula:get_content(ReaderPool, Realm, MCID), Bytes);
+classify_put_content({error, _} = E, _ReaderPool, _Realm, _Bytes) ->
     E.
 
 classify_get_content({ok, Bytes}, Bytes) -> ok;
@@ -315,25 +315,25 @@ classify_get_content({error, _} = E, _Bytes) -> E.
 %% MCID (codec `16#56') and the get fetches the manifest, then every chunk,
 %% and verifies the whole. Every other content probe puts 8 KiB, which is
 %% always one block and never takes that path.
--spec put_get_chunked_content(macula:pool()) -> result().
-put_get_chunked_content(Pool) ->
-    do_put_get_chunked_content(Pool, Pool).
+-spec put_get_chunked_content(macula:pool(), macula:realm()) -> result().
+put_get_chunked_content(Pool, Realm) ->
+    do_put_get_chunked_content(Pool, Pool, Realm).
 
 %% @doc Cross-station variant: Writer puts on one station, Reader fetches
 %% the manifest and its chunks through a different one.
--spec cross_station_put_chunked_content(macula:pool(), macula:pool()) ->
-    result().
-cross_station_put_chunked_content(WriterPool, ReaderPool) ->
-    do_put_get_chunked_content(WriterPool, ReaderPool).
+-spec cross_station_put_chunked_content(macula:pool(), macula:pool(),
+                                        macula:realm()) -> result().
+cross_station_put_chunked_content(WriterPool, ReaderPool, Realm) ->
+    do_put_get_chunked_content(WriterPool, ReaderPool, Realm).
 
-do_put_get_chunked_content(WriterPool, ReaderPool) ->
+do_put_get_chunked_content(WriterPool, ReaderPool, Realm) ->
     Bytes = crypto:strong_rand_bytes(?CHUNKED_CONTENT_BYTES),
-    classify_chunked_put(macula:put_content(WriterPool, Bytes),
-                         ReaderPool, Bytes).
+    classify_chunked_put(macula:share_content(WriterPool, Realm, Bytes),
+                         ReaderPool, Realm, Bytes).
 
-classify_chunked_put({ok, MCID}, ReaderPool, Bytes) ->
-    fetch_chunked_content(chunked_mcid(MCID), ReaderPool, Bytes);
-classify_chunked_put({error, _} = E, _ReaderPool, _Bytes) ->
+classify_chunked_put({ok, MCID}, ReaderPool, Realm, Bytes) ->
+    fetch_chunked_content(chunked_mcid(MCID), ReaderPool, Realm, Bytes);
+classify_chunked_put({error, _} = E, _ReaderPool, _Realm, _Bytes) ->
     E.
 
 %% A put that took the manifest path names a manifest MCID: SHA-384, tag 2,
@@ -343,9 +343,9 @@ classify_chunked_put({error, _} = E, _ReaderPool, _Bytes) ->
 chunked_mcid(<<2, 16#56, _:48/binary>> = MCID) -> {ok, MCID};
 chunked_mcid(MCID)                             -> {error, {not_chunked, MCID}}.
 
-fetch_chunked_content({ok, MCID}, ReaderPool, Bytes) ->
-    classify_get_content(macula:get_content(ReaderPool, MCID), Bytes);
-fetch_chunked_content({error, _} = E, _ReaderPool, _Bytes) ->
+fetch_chunked_content({ok, MCID}, ReaderPool, Realm, Bytes) ->
+    classify_get_content(macula:get_content(ReaderPool, Realm, MCID), Bytes);
+fetch_chunked_content({error, _} = E, _ReaderPool, _Realm, _Bytes) ->
     E.
 
 %% @doc Cross-station pub/sub roundtrip. PubPool is dialled into one
@@ -862,25 +862,26 @@ classify_dht_concurrency(PutErrors, FindErrors) ->
 %% @doc N concurrent put_content calls; after replication delay,
 %% get each content back; assert byte-for-byte match. Single-pool
 %% variant.
--spec many_concurrent_blobs(NumBlobs :: pos_integer(),
-                            macula:pool()) -> result().
-many_concurrent_blobs(NumBlobs, Pool) ->
-    do_many_concurrent_blobs(NumBlobs, Pool, Pool).
+-spec many_concurrent_blobs(NumBlobs :: pos_integer(), macula:pool(),
+                            macula:realm()) -> result().
+many_concurrent_blobs(NumBlobs, Pool, Realm) ->
+    do_many_concurrent_blobs(NumBlobs, Pool, Pool, Realm).
 
 %% @doc Cross-station variant — Writer puts on one station, Reader
 %% fetches from a different one. Stresses content's eager k=3
 %% replication + 1-hop iterative fetch under burst load.
 -spec cross_station_many_concurrent_blobs(
-        pos_integer(), macula:pool(), macula:pool()) -> result().
-cross_station_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool) ->
-    do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool).
+        pos_integer(), macula:pool(), macula:pool(), macula:realm()) ->
+    result().
+cross_station_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool, Realm) ->
+    do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool, Realm).
 
-do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool) ->
+do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool, Realm) ->
     Blobs = [{N, crypto:strong_rand_bytes(8192)}
              || N <- lists:seq(1, NumBlobs)],
     Parent = self(),
     Writers = [spawn_link(fun() ->
-        R = macula:put_content(WriterPool, Bytes),
+        R = macula:share_content(WriterPool, Realm, Bytes),
         Parent ! {blob_put_done, self(), N, Bytes, R}
     end) || {N, Bytes} <- Blobs],
     Mcids = gather_blob_puts(Writers, NumBlobs, []),
@@ -888,7 +889,7 @@ do_many_concurrent_blobs(NumBlobs, WriterPool, ReaderPool) ->
         {error, _} = E -> E;
         Pairs ->
             timer:sleep(?DHT_REPLICATION_MS),
-            run_concurrent_gets(ReaderPool, Pairs)
+            run_concurrent_gets(ReaderPool, Realm, Pairs)
     end.
 
 gather_blob_puts([], 0, Acc) -> lists:reverse(Acc);
@@ -907,10 +908,10 @@ gather_blob_puts(Pids, Remaining, Acc) ->
                  completed, length(Acc)}}
     end.
 
-run_concurrent_gets(ReaderPool, Pairs) ->
+run_concurrent_gets(ReaderPool, Realm, Pairs) ->
     Parent = self(),
     Getters = [spawn_link(fun() ->
-        R = macula:get_content(ReaderPool, MCID),
+        R = macula:get_content(ReaderPool, Realm, MCID),
         Parent ! {blob_get_done, self(), N, Bytes, R}
     end) || {N, MCID, Bytes} <- Pairs],
     gather_blob_gets(Getters, length(Pairs), []).

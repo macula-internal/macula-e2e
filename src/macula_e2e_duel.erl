@@ -850,8 +850,8 @@ classify_absent_record({ok, Record}) ->
     {error, {absent_key_answered, record_key(Record)}}.
 
 fresh_record(Realm) ->
-    Identity = macula_identity:generate(),
-    NodeId   = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId   = macula_e2e_keys:node_id(Identity),
     Record   = macula_record:node_record(NodeId, [Realm], 0,
                                          #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
@@ -869,11 +869,10 @@ content_put_get_cross(A, B) ->
 %% @doc Content across four orders of magnitude.
 %%
 %% Every content probe in this repo is hardcoded at 8192 bytes. The
-%% real boundaries are the relay's 256 KiB chunk and the 16 MiB frame
-%% cap, and `put_content/2' has no client-side chunking — its own doc
-%% says an oversized blob surfaces as a CALL-deadline timeout rather
-%% than a clean refusal. This walks up to them and reports the first
-%% size that fails rather than stopping at the first success.
+%% boundary that matters is 256 KiB, where a share becomes a manifest
+%% over chunks rather than one raw block (D24), and the frame cap above
+%% it. This walks up to them and reports the first size that fails
+%% rather than stopping at the first success.
 content_size_axis(A, B) ->
     Results = [{Size, content_round_trip(A, B, Size)}
                || Size <- ?CONTENT_SIZES],
@@ -885,7 +884,8 @@ classify_sizes(Failed) -> {error, {sizes_failed, Failed}}.
 
 content_round_trip(A, B, Size) ->
     Bytes = crypto:strong_rand_bytes(Size),
-    Put   = macula:put_content(macula_e2e_service:pool(A), Bytes),
+    Put   = macula:share_content(macula_e2e_service:pool(A),
+                                 macula_e2e_service:realm(A), Bytes),
     on_put_content(Put, B, Bytes).
 
 on_put_content({error, Reason}, _B, Bytes) ->
@@ -893,16 +893,18 @@ on_put_content({error, Reason}, _B, Bytes) ->
 on_put_content({ok, Mcid}, B, Bytes) ->
     fetch_with_retry(B, Mcid, Bytes, ?CONTENT_FETCH_ATTEMPTS, 0).
 
-%% `put_content/2' answering ok means the WRITER's station stored the
-%% blob, not that the reader's station can reach it. Retrying separates
-%% the two failures that a single get cannot: a blob that is merely LATE
-%% across the hop, and one that never arrives. Both are defects when put
-%% has already answered ok, but they have different causes and a report
+%% `share_content/3' answering ok means the WRITER's own node keeps and
+%% announces the blob (D27), not that the reader's node can reach it.
+%% Retrying separates the two failures that a single get cannot: a blob
+%% that is merely LATE across the hop, and one that never arrives. Both
+%% are defects when the share has already answered ok, but they have
+%% different causes and a report
 %% that merges them sends the reader to the wrong place.
 fetch_with_retry(_B, _Mcid, Bytes, 0, Attempts) ->
     {error, {content_never_arrived, byte_size(Bytes), attempts, Attempts}};
 fetch_with_retry(B, Mcid, Bytes, Left, Attempts) ->
-    Got = macula:get_content(macula_e2e_service:pool(B), Mcid),
+    Got = macula:get_content(macula_e2e_service:pool(B),
+                              macula_e2e_service:realm(B), Mcid),
     classify_fetched(Got, Bytes, B, Mcid, Left, Attempts + 1).
 
 classify_fetched({ok, Bytes}, Bytes, _B, _Mcid, _Left, 1) ->
@@ -1086,7 +1088,7 @@ classify_pub_sub_timeout(PubDone, SubDone) ->
 rpc_wrapper_cross(A, B) ->
     Realm     = macula_e2e_service:realm(A),
     Procedure = macula_e2e_service:procedure(B, <<"wrapper_cross">>),
-    Identity  = macula_identity:generate(),
+    Identity  = macula_e2e_keys:new(),
     {ok, Sup} = macula_response:advertise_direct(
                   macula_e2e_service:pool(B), Realm, Procedure,
                   macula_e2e_wrapper_callback, self(), Identity),
@@ -1125,7 +1127,7 @@ classify_wrapper_reply({error, _} = E, _) ->
 streaming_wrapper_cross(A, B) ->
     Realm     = macula_e2e_service:realm(A),
     Procedure = macula_e2e_service:procedure(B, <<"wrapper_cross_stream">>),
-    Identity  = macula_identity:generate(),
+    Identity  = macula_e2e_keys:new(),
     {ok, StreamerSup} = macula_streamer:advertise_direct(
                            macula_e2e_service:pool(B), Realm, Procedure,
                            macula_e2e_wrapper_callback, self(), Identity),
@@ -1201,7 +1203,7 @@ content_wrapper_cross_attempt(A, B, Left) ->
 on_wrapper_fed({error, _} = E, _A, _B, _Realm, _Bytes, _Left) ->
     E;
 on_wrapper_fed({ok, Mcid}, A, B, Realm, Bytes, Left) ->
-    {ok, DownloaderPid} = macula_download:start_link_direct(
+    {ok, DownloaderPid} = macula_download:start_link(
                             macula_e2e_wrapper_callback, macula_e2e_service:pool(B),
                             Realm, Mcid, self()),
     Result = receive
@@ -1228,12 +1230,16 @@ on_wrapper_download({error, _}, A, B, Left) ->
 %% open checklist item.
 %%====================================================================
 
-%% @doc B resolves A's content endpoint ONCE and reuses that exact URL
-%% for both a large download and several concurrent unary RPC calls, so
-%% both genuinely ride the SAME QUIC connection -- proving isolation
-%% requires that, not just "separate stations". Asserts the RPC calls
-%% complete within their normal latency budget while the download is in
-%% flight, not stalled behind it.
+%% @doc A large content fetch and several concurrent unary calls on ONE
+%% pool: both open their own stream over the pool's link to its station,
+%% so per-stream isolation means the calls complete inside their normal
+%% latency budget while a 1 MiB transfer is genuinely in flight, not
+%% queued behind it. macula 16 took the provider-resolution path this
+%% round used (`macula_direct_dial:resolve_content_provider/2',
+%% `macula:get_content_station/5') with the D27 content model, so it now
+%% measures the public fetch (`macula:get_content/4') and the public call
+%% (`macula:call/5') on the same pool, which is the property that
+%% matters to a caller and survives the API change.
 quic_isolation_rpc_survives_large_content(A, B) ->
     Realm = macula_e2e_service:realm(A),
     Bytes = crypto:strong_rand_bytes(?ISOLATION_CONTENT_SIZE),
@@ -1254,42 +1260,28 @@ isolation_feed_and_await(A, Realm, Bytes) ->
 
 on_isolation_fed({error, _} = E, _A, _B, _Realm, _Bytes) -> E;
 on_isolation_fed({ok, Mcid}, A, B, Realm, Bytes) ->
-    on_isolation_resolved(
-      macula_direct_dial:resolve_content_provider(macula_e2e_service:pool(B), Mcid),
-      A, B, Realm, Mcid, Bytes).
-
-on_isolation_resolved({error, Reason}, _A, _B, _Realm, _Mcid, _Bytes) ->
-    {error, {content_not_resolved, Reason}};
-on_isolation_resolved({ok, #{endpoint := Url, announcer_node := Node}},
-                      A, B, Realm, Mcid, Bytes) ->
     Self = self(),
-    TrustOpts = #{expected_node_id => Node, pin_tls_cert => false, verify => none},
     PoolB = macula_e2e_service:pool(B),
     {DlPid, DlMon} = spawn_monitor(fun() ->
-        Result = macula:get_content_station(PoolB, Url, Mcid,
-                                            ?WRAPPER_DIRECT_TIMEOUT_MS, TrustOpts),
-        Self ! {isolation_download, Result}
+        Self ! {isolation_download,
+                macula:get_content(PoolB, Realm, Mcid,
+                                   #{max_bytes => ?ISOLATION_CONTENT_SIZE * 2,
+                                     chunk_timeout_ms => ?WRAPPER_DIRECT_TIMEOUT_MS})}
     end),
     %% Let the download actually open its dedicated stream before the
     %% concurrent calls fire, so they land while the transfer is
     %% genuinely in flight rather than racing its own setup.
     timer:sleep(200),
     Procedure = macula_e2e_service:procedure(A, <<"echo">>),
-    RpcResults = [timed_isolation_rpc(PoolB, Realm, Procedure, Url, TrustOpts, I)
+    RpcResults = [timed_isolation_rpc(PoolB, Realm, Procedure, I)
                   || I <- lists:seq(1, ?ISOLATION_RPC_CALLS)],
     DownloadResult = await_isolation_download(DlPid, DlMon, Bytes),
     classify_isolation(RpcResults, DownloadResult).
 
-timed_isolation_rpc(PoolB, Realm, Procedure, Url, TrustOpts, I) ->
+timed_isolation_rpc(PoolB, Realm, Procedure, I) ->
     Started = erlang:monotonic_time(millisecond),
-    %% macula:call_station/7's last arg is ONE opts map carrying both the
-    %% UCAN token (under ucan_token, absent here) and the trust overrides
-    %% -- there is no public /8 that takes them as separate positional
-    %% args (that split happens internally, in macula_client). This call
-    %% was never exercised until the DHT-walk fix made the resolve step
-    %% upstream of it succeed for the first time, so the undef survived.
-    Reply = macula:call_station(PoolB, Url, Realm, Procedure, #{<<"i">> => I},
-                                ?CALL_TIMEOUT_MS, TrustOpts),
+    Reply = macula:call(PoolB, Realm, Procedure, #{<<"i">> => I},
+                        ?CALL_TIMEOUT_MS),
     Elapsed = erlang:monotonic_time(millisecond) - Started,
     {I, Elapsed, Reply}.
 
@@ -1345,9 +1337,9 @@ classify_isolation_detail(_Slow, Failed, RpcResults) ->
 %% identity is accepted regardless of puzzle validity) -- but proves a
 %% VALID puzzle identity specifically is never rejected on principle.
 dht_puzzle_accept(_A, B) ->
-    Identity = macula_identity:generate(#{puzzle => true}),
+    Identity = macula_e2e_keys:new(#{puzzle => true}),
     Seed = macula_e2e_fleet:seed_url(macula_e2e_service:station(B)),
-    on_puzzle_connect(macula:connect([Seed], #{identity => Identity}), B).
+    on_puzzle_connect(macula:connect([Seed], #{node_identity => Identity}), B).
 
 on_puzzle_connect({error, _} = E, _B) -> E;
 on_puzzle_connect({ok, Pool}, B) ->
@@ -1444,8 +1436,8 @@ report_puzzle_revert(Station, Reason) ->
 %% gets a fast explicit answer).
 attempt_non_puzzle_connect(Station) ->
     Seed = macula_e2e_fleet:seed_url(Station),
-    Identity = macula_identity:generate(),  %% deliberately NOT puzzle-hardened
-    {ok, Pool} = macula:connect([Seed], #{identity => Identity}),
+    Identity = macula_e2e_keys:new(),  %% deliberately NOT puzzle-hardened
+    {ok, Pool} = macula:connect([Seed], #{node_identity => Identity}),
     timer:sleep(?SETTLE_MS),
     Probe = macula:find_record(Pool, crypto:strong_rand_bytes(32)),
     Result = classify_reject(Probe),

@@ -342,11 +342,13 @@ pool_close_cleanup(Config) ->
 
 put_get_content(Config) ->
     Pool = ?config(pool, Config),
-    expect_ok(macula_e2e_probe:put_get_content(Pool)).
+    Realm = ?config(test_realm, Config),
+    expect_ok(macula_e2e_probe:put_get_content(Pool, Realm)).
 
 put_get_chunked_content(Config) ->
     Pool = ?config(pool, Config),
-    expect_ok(macula_e2e_probe:put_get_chunked_content(Pool)).
+    Realm = ?config(test_realm, Config),
+    expect_ok(macula_e2e_probe:put_get_chunked_content(Pool, Realm)).
 
 %%--------------------------------------------------------------------
 %% Supervised-primitive-wrapper probes (macula 9.2.0)
@@ -417,12 +419,14 @@ cross_station_dht_put_find(Config) ->
 
 cross_station_put_content(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
-        macula_e2e_probe:cross_station_put_content(Writer, Reader)
+        Realm = ?config(test_realm, Config),
+        macula_e2e_probe:cross_station_put_content(Writer, Reader, Realm)
     end).
 
 cross_station_put_chunked_content(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
-        macula_e2e_probe:cross_station_put_chunked_content(Writer, Reader)
+        Realm = ?config(test_realm, Config),
+        macula_e2e_probe:cross_station_put_chunked_content(Writer, Reader, Realm)
     end).
 
 %%--------------------------------------------------------------------
@@ -514,11 +518,14 @@ cross_station_many_concurrent_dht_records(Config) ->
 
 many_concurrent_blobs(Config) ->
     Pool = ?config(pool, Config),
-    expect_ok(macula_e2e_probe:many_concurrent_blobs(5, Pool)).
+    Realm = ?config(test_realm, Config),
+    expect_ok(macula_e2e_probe:many_concurrent_blobs(5, Pool, Realm)).
 
 cross_station_many_concurrent_blobs(Config) ->
     cross_or_skip(Config, fun(Writer, Reader) ->
-        macula_e2e_probe:cross_station_many_concurrent_blobs(5, Writer, Reader)
+        Realm = ?config(test_realm, Config),
+        macula_e2e_probe:cross_station_many_concurrent_blobs(5, Writer, Reader,
+                                                             Realm)
     end).
 
 tombstone_propagation(Config) ->
