@@ -3,6 +3,11 @@ name: build
 on:
   push:
     branches: [main]
+  # A branch had no check at all: a reviewer could only be told "it
+  # compiles here", which is how a suite that could not run a single case
+  # stayed green for a month (macula-internal/macula-e2e#1). The image job
+  # stays main-only, since it tags `:latest` from whatever it builds.
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -35,7 +40,41 @@ jobs:
       - name: eunit
         run: rebar3 eunit
 
+  # ⛔ No xref job yet, and that is a measurement, not a preference.
+  #
+  # eunit cannot see the rot this harness suffered (macula-internal/
+  # macula-e2e#1): Erlang resolves remote calls at run time, so sixteen calls
+  # to `macula_identity' — a module macula deleted at 12 — compiled happily,
+  # passed lint and eunit, and failed only when a case tried to run them.
+  # xref reads those calls before anything runs, so it is the right check.
+  #
+  # But `rebar3 xref' exits 1 the moment it has anything to report: it gates.
+  # At ff6ead0 it reports 132 warnings — 17 calls to functions this tree does
+  # not define (`macula_identity:generate/0' and `macula_identity:public/1',
+  # gone since macula 12; `macula:put_content/2' and `macula:get_content/2',
+  # which macula 16 took a realm and became `share_content/3' and
+  # `get_content/3'; `macula_download:start_link_direct/5',
+  # `macula:get_content_station/5', `macula_direct_dial:
+  # resolve_content_provider/2'), in `macula_e2e_duel' and
+  # `macula_e2e_probe' — and 115 unused exports, which in an escript
+  # collection is noise but still fails the run. Every one pre-dates this
+  # branch. Repairing them is the rest of e2e#1's suite.
+  #
+  # Reddening main on pre-existing rot before that repair is an outage, not a
+  # check, and a job marked continue-on-error is theatre. So the job lands
+  # with the repair, in the commit that makes `rebar3 xref' green here.
+
+  # ⛔ The live burst is NOT a CI job, deliberately. The stations are
+  # AAAA-only and a GitHub-hosted runner has no IPv6 egress
+  # (`seam/realm_seam_SUITE`'s own header records mcl-om's live-mesh-tests
+  # job burning 18 minutes a run for a deterministic red), and this
+  # repository is PUBLIC, so no self-hosted runner may take work from it.
+  # A job that can only read as skipped is theatre; the burst runs on demand
+  # instead, from a machine with IPv6 egress — `scripts/run-page-burst.sh`,
+  # and the README says when.
+
   image:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: [lint, eunit]
     permissions:

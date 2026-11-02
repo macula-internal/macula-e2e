@@ -45,6 +45,8 @@
     cross_station_multi_publisher_pubsub/1,
     many_concurrent_calls/1,
     cross_station_many_concurrent_calls/1,
+    page_burst/1,
+    cross_station_page_burst/1,
     many_concurrent_streams/1,
     cross_station_many_concurrent_streams/1,
     many_concurrent_dht_records/1,
@@ -112,6 +114,8 @@ all() ->
      cross_station_multi_publisher_pubsub,
      many_concurrent_calls,
      cross_station_many_concurrent_calls,
+     page_burst,
+     cross_station_page_burst,
      many_concurrent_streams,
      cross_station_many_concurrent_streams,
      many_concurrent_dht_records,
@@ -195,21 +199,33 @@ connect_fleet(Bootstrap, BootstrapOther, Config) ->
     %% Explicit puzzle-hardened identities, the kind macula generates by
     %% default, so each pool's node id is known: the RPC probes assert the
     %% `caller' a handler sees is the pool that called.
-    PoolKp  = macula_identity:generate(#{puzzle => true}),
-    OtherKp = macula_identity:generate(#{puzzle => true}),
-    CrossKp = macula_identity:generate(#{puzzle => true}),
-    {ok, Pool}  = macula:connect(Bootstrap, #{identity => PoolKp}),
-    {ok, Other} = macula:connect(Bootstrap, #{identity => OtherKp}),
+    PoolKp  = macula_e2e_keys:new(#{puzzle => true}),
+    OtherKp = macula_e2e_keys:new(#{puzzle => true}),
+    CrossKp = macula_e2e_keys:new(#{puzzle => true}),
+    %% macula-portal#89 is an mcl-tube lookup, and mcl-tube advertises inside
+    %% an org namespace: a pool that pins no realm key cannot resolve it and
+    %% answers `{error, {unresolved, no_trusted_advertisement}}' at the FULL
+    %% deadline, which is the very 5 s loss the issue reports. The portal
+    %% pins io.macula on its one pool, so the harness pins the same key on
+    %% its pools; the `_test' realm probes advertise `_/...' and never
+    %% consult it.
+    Trust = macula_e2e_io_macula_realm:trust(),
+    {ok, Pool}  = macula:connect(Bootstrap,
+                                 #{node_identity => PoolKp, realm_trust => Trust}),
+    {ok, Other} = macula:connect(Bootstrap,
+                                 #{node_identity => OtherKp, realm_trust => Trust}),
     {CrossOpt, CrossPools} =
         case BootstrapOther of
             undefined -> {undefined, []};
             _ ->
-                {ok, X} = macula:connect(BootstrapOther, #{identity => CrossKp}),
+                {ok, X} = macula:connect(BootstrapOther,
+                                         #{node_identity => CrossKp,
+                                           realm_trust => Trust}),
                 {X, [X]}
         end,
-    NodeIds = [{pool_node_id,  macula_identity:public(PoolKp)},
-               {other_node_id, macula_identity:public(OtherKp)},
-               {cross_node_id, macula_identity:public(CrossKp)}],
+    NodeIds = [{pool_node_id,  macula_e2e_keys:node_id(PoolKp)},
+               {other_node_id, macula_e2e_keys:node_id(OtherKp)},
+               {cross_node_id, macula_e2e_keys:node_id(CrossKp)}],
     %% macula:connect/2 spawns gen_servers linked to the caller. CT's
     %% init_per_suite controller exits with Config as its reason after
     %% returning, killing the linked pools before any test case runs.
@@ -443,6 +459,29 @@ cross_station_many_concurrent_calls(Config) ->
         Procedure = unique_topic(<<"e2e.cross.many.echo">>),
         macula_e2e_probe:cross_station_many_concurrent_calls(
             10, Server, Caller, Realm, Procedure)
+    end).
+
+%% macula-portal#89: the tube channel page's eight thumbnails, fired at once
+%% by ONE caller inside the portal's own 5 s call deadline, against the real
+%% mcl-tube on the fleet. Nothing is advertised here: the provider is the
+%% service, and each reply is checked against the MCID that asked for it, so
+%% a crossed, truncated or substituted reply fails even at the right size.
+-define(PAGE_DEADLINE_MS, 5_000).
+
+page_burst(Config) ->
+    Pool = ?config(pool, Config),
+    expect_ok(macula_e2e_probe:page_burst(
+                Pool, ?config(io_macula_realm, Config),
+                macula_e2e_mcl_tube:mcids(), ?PAGE_DEADLINE_MS)).
+
+%% The same page dialed through a station in another part of the federation.
+%% The portal's own box is not where mcl-tube runs, so the extra hop is the
+%% normal case rather than a variant of it.
+cross_station_page_burst(Config) ->
+    cross_or_skip(Config, fun(_Pool, Cross) ->
+        expect_ok(macula_e2e_probe:page_burst(
+                    Cross, ?config(io_macula_realm, Config),
+                    macula_e2e_mcl_tube:mcids(), ?PAGE_DEADLINE_MS))
     end).
 
 many_concurrent_streams(Config) ->
@@ -711,9 +750,44 @@ bootstrap_seeds_other() ->
 
 parse_seeds(false, Default) -> Default;
 parse_seeds(Env,   _Default) ->
-    [list_to_binary(string:trim(U))
-     || U <- string:split(Env, ",", all),
-        string:trim(U) =/= ""].
+    [seed(U) || U <- string:split(Env, ",", all),
+                string:trim(U) =/= ""].
+
+%% macula 16 refuses a seed that does not name the node id it expects
+%% (`macula:connect/2': "Every seed names the node_id it expects, in the seed
+%% or in the `expected_node_id' option"), and a URL binary cannot carry one.
+%% A pinned seed is therefore `https://host:port#<64 hex node id>', parsed here
+%% into the map form macula wants. A bare URL is passed through unchanged on
+%% purpose: macula then answers `{error, {seeds, expected_node_id_required}}',
+%% which tells the operator what to add better than dropping it here would.
+%%
+%% Node ids are the stations' own, published in the mesh's station directory
+%% (mcl-stations/list_stations) and in macula-fleet's release-targets.
+seed(Entry) ->
+    case string:split(string:trim(Entry), "#", trailing) of
+        [Url, NodeIdHex] -> pinned_seed(Url, NodeIdHex);
+        [Url]            -> list_to_binary(Url)
+    end.
+
+pinned_seed(Url, NodeIdHex) ->
+    {Host, Port} = split_host_port(Url),
+    #{host            => Host,
+      port            => Port,
+      expected_node_id => binary:decode_hex(
+                            list_to_binary(string:trim(NodeIdHex)))}.
+
+%% `https://host[:port]' or `host[:port]'. 4433 is the station QUIC port the
+%% fleet runs (macula-fleet's release-targets check lines use it).
+split_host_port(Url) ->
+    Bare = strip_scheme(string:trim(Url)),
+    case string:split(Bare, ":", trailing) of
+        [Host, Port] -> {list_to_binary(Host), list_to_integer(Port)};
+        [Host]       -> {list_to_binary(Host), 4433}
+    end.
+
+strip_scheme("https://" ++ Rest) -> Rest;
+strip_scheme("http://" ++ Rest)  -> Rest;
+strip_scheme(Other)              -> Other.
 
 wait_for_healthy([], _Remaining) ->
     ok;

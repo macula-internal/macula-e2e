@@ -48,11 +48,35 @@ below) without touching the probe logic.
 ### Local
 
 ```bash
-MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433" \
+MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433#<64 hex node id>" \
   rebar3 ct --suite test/macula_e2e_SUITE
 ```
 
-`MACULA_E2E_BOOTSTRAP` is required; there is no default seed.
+`MACULA_E2E_BOOTSTRAP` is required; there is no default seed. macula 16
+refuses a seed that does not name the node id it expects
+(`{error, {seeds, expected_node_id_required}}`), and a URL binary cannot carry
+one, so a seed is `https://host:port#<node id>` — the ids are published by
+mcl-stations' `list_stations`.
+
+### What CI runs, and what it cannot
+
+CI runs `rebar3 as lint lint` and `rebar3 eunit`, both on hosted runners. It
+does not run the suite: the stations are AAAA-only, a hosted runner has no
+IPv6 egress, and this repository is public, so no self-hosted runner may take
+work from it either. It does not run `rebar3 xref` yet, though that is the
+check that catches what eunit cannot — a call to a module or function that no
+longer exists compiles and passes eunit, which is how sixteen calls to
+`macula_identity` survived a year of green builds
+(macula-internal/macula-e2e#1). `rebar3 xref` exits 1 on any warning, so the
+job would be red on rot that pre-dates the branch (132 warnings at ff6ead0);
+it lands with the repair of `macula_e2e_duel` and `macula_e2e_probe`, which
+is the rest of e2e#1's suite.
+
+The live burst runs by hand, from a machine with IPv6 egress, with
+[`scripts/run-page-burst.sh`](scripts/run-page-burst.sh): before a portal
+release, after any station release or fleet move, and whenever someone
+reports a thumbnail that does not render. Green there means the channel
+page's eight thumbnails all answer inside the portal's own 5 s deadline.
 
 ### Seam suite (station and realm, no fleet)
 

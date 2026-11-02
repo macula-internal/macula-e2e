@@ -40,6 +40,7 @@
     cross_station_multi_publisher_pubsub/6,
     many_concurrent_calls/5,
     cross_station_many_concurrent_calls/5,
+    page_burst/4,
     many_concurrent_streams/5,
     cross_station_many_concurrent_streams/5,
     many_concurrent_dht_records/3,
@@ -169,7 +170,7 @@ check_no_cross_realm(SubRef, PubPool, RealmA, Topic) ->
                 macula:procedure()) -> result().
 unary_rpc(ServerPool, CallerPool, CallerNodeId, Realm, Procedure) ->
     Handler = fun(Args) -> {ok, #{<<"got">> => Args}} end,
-    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{auth => open}),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Args = #{<<"x">> => 42},
     Reply = macula:call(CallerPool, Realm, Procedure, Args, 5_000),
@@ -254,8 +255,8 @@ on_recv({error, _} = E, _Stream, _Acc)    -> E.
 %% `?DHT_REPLICATION_MS' before the find.
 -spec dht_put_find(macula:pool(), macula:realm()) -> result().
 dht_put_find(Pool, Realm) ->
-    Identity = macula_identity:generate(),
-    NodeId = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId = macula_e2e_keys:node_id(Identity),
     Record = macula_record:node_record(NodeId, [Realm], 0,
                                        #{kind => <<"test_daemon">>}),
     Signed = macula_record:sign(Record, Identity),
@@ -527,7 +528,7 @@ extract_token(Payload) ->
                             macula:procedure()) -> result().
 many_concurrent_calls(NumCalls, ServerPool, CallerPool, Realm, Procedure) ->
     Handler = fun(Args) -> {ok, #{<<"echo">> => Args}} end,
-    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{auth => open}),
     timer:sleep(?ADVERTISE_SETTLE_MS),
     Parent = self(),
     Callers = [spawn_link(fun() ->
@@ -550,6 +551,119 @@ cross_station_many_concurrent_calls(NumCalls, ServerPool, CallerPool,
                                     Realm, Procedure) ->
     many_concurrent_calls(NumCalls, ServerPool, CallerPool,
                           Realm, Procedure).
+
+%% @doc macula-portal#89: the tube channel page's eight thumbnail lookups,
+%% fired at once by ONE caller, every one inside the portal's own 5 s call
+%% deadline.
+%%
+%% This advertises NOTHING. The provider is mcl-tube on the fleet
+%% (`macula_e2e_mcl_tube'), and the caller's pool must be connected with
+%% io.macula's realm key pinned (`realm_trust'), or every lookup answers
+%% `{error, {unresolved, no_trusted_advertisement}}' at the FULL deadline.
+%% That is a 5 s loss produced by the harness, indistinguishable from the one
+%% the issue reports, so the pin is part of the probe and not an extra.
+%%
+%% Why this and not many_concurrent_calls/5: that one advertises its own echo
+%% and returns a correlation id, so no reply crosses a size at which the
+%% caller's admission, framing or route could behave differently, and no
+%% reply is content-addressed. Here each reply is checked against the MCID
+%% that asked for it (`macula_e2e_mcl_tube:bytes_match/2'), so a crossed,
+%% truncated or substituted reply cannot pass as an answer.
+%%
+%% A red run names EVERY lookup that did not answer with its own bytes inside
+%% DeadlineMs, beside how long it actually took, so the result says which
+%% shape of loss it was -- not-found, unresolved, wrong content, or a reply
+%% that arrived too late.
+-spec page_burst(Pool :: macula:pool(),
+                 macula:realm(),
+                 Mcids :: [binary()],
+                 DeadlineMs :: pos_integer()) -> result().
+page_burst(Pool, Realm, [First | _] = Mcids, DeadlineMs) ->
+    warm_then_burst(warm_up(Pool, Realm, First, DeadlineMs),
+                    Pool, Realm, Mcids, DeadlineMs).
+
+warm_then_burst({error, _} = Refused, _Pool, _Realm, _Mcids, _DeadlineMs) ->
+    Refused;
+warm_then_burst({ok, _WarmMs}, Pool, Realm, Mcids, DeadlineMs) ->
+    fire_page(Pool, Realm, Mcids, DeadlineMs).
+
+%% One lookup on its own before the burst: the burst may not be the first
+%% traffic this pool ever sends, and a run in which NO lookup works at all
+%% says something different from one in which seven of eight do.
+warm_up(Pool, Realm, Mcid, DeadlineMs) ->
+    T0 = erlang:monotonic_time(millisecond),
+    Reply = macula:call(Pool, Realm, macula_e2e_mcl_tube:procedure(),
+                        macula_e2e_mcl_tube:payload(Mcid), DeadlineMs),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    case judge_one(Mcid, Reply) of
+        ok    -> {ok, Elapsed};
+        Why   -> {error, {page_burst_warm_up, ms, Elapsed, why, Why}}
+    end.
+
+fire_page(Pool, Realm, Mcids, DeadlineMs) ->
+    Parent = self(),
+    Started = erlang:monotonic_time(millisecond),
+    Ref = make_ref(),
+    [spawn_link(fun() ->
+        T0 = erlang:monotonic_time(millisecond),
+        Reply = macula:call(Pool, Realm, macula_e2e_mcl_tube:procedure(),
+                            macula_e2e_mcl_tube:payload(Mcid), DeadlineMs),
+        Parent ! {Ref, Seq, Mcid, erlang:monotonic_time(millisecond) - T0, Reply}
+     end) || {Seq, Mcid} <- lists:zip(lists:seq(1, length(Mcids)), Mcids)],
+    Outcome = collect_page(Ref, length(Mcids), []),
+    Total = erlang:monotonic_time(millisecond) - Started,
+    judge_page(Outcome, Total, DeadlineMs).
+
+collect_page(_Ref, 0, Acc) ->
+    lists:reverse(Acc);
+collect_page(Ref, Remaining, Acc) ->
+    receive
+        {Ref, Seq, Mcid, Elapsed, Reply} ->
+            collect_page(Ref, Remaining - 1,
+                         [{Seq, Mcid, Elapsed, judge_one(Mcid, Reply)} | Acc])
+    after 60_000 ->
+        {error, {page_burst, no_answer, outstanding, Remaining}}
+    end.
+
+judge_one(Mcid, {ok, Reply}) when is_map(Reply) ->
+    case normalise_keys(Reply) of
+        #{<<"bytes">> := Bytes} when is_binary(Bytes) ->
+            judge_bytes(Mcid, Bytes);
+        Other ->
+            {no_bytes, Other}
+    end;
+judge_one(_Mcid, {ok, Other}) ->
+    {unexpected_reply, Other};
+judge_one(_Mcid, {error, Reason}) ->
+    {error, Reason};
+judge_one(_Mcid, Other) ->
+    {unexpected, Other}.
+
+judge_bytes(Mcid, Bytes) ->
+    case macula_e2e_mcl_tube:bytes_match(Bytes, Mcid) of
+        true  -> ok;
+        false -> {wrong_bytes, byte_size(Bytes), not_the_mcid_asked_for}
+    end.
+
+judge_page({error, _} = E, _Total, _DeadlineMs) ->
+    E;
+judge_page(Outcome, Total, DeadlineMs) ->
+    Bad = [{seq, Seq, mcid, short_mcid(Mcid), ms, Elapsed, why, Why}
+           || {Seq, Mcid, Elapsed, Why} <- Outcome, Why =/= ok],
+    judge_lost(Bad, Total, DeadlineMs).
+
+%% A full MCID in a failure term buries the report in 100 hex characters.
+short_mcid(Mcid) ->
+    binary:part(Mcid, 0, 12).
+
+judge_lost([], Total, DeadlineMs) when Total =< DeadlineMs ->
+    ok;
+judge_lost([], Total, DeadlineMs) ->
+    {error, {page_burst_all_answered_but_late, total_ms, Total,
+             deadline_ms, DeadlineMs}};
+judge_lost(Bad, Total, DeadlineMs) ->
+    {error, {page_burst_lost, total_ms, Total, deadline_ms, DeadlineMs,
+             lost, Bad}}.
 
 gather_caller_results([], 0, Errors) ->
     case Errors of
@@ -677,8 +791,8 @@ cross_station_many_concurrent_dht_records(NumRecords, WriterPool,
 
 do_many_concurrent_dht_records(NumRecords, WriterPool, ReaderPool, Realm) ->
     Records = [begin
-        Identity = macula_identity:generate(),
-        NodeId   = macula_identity:public(Identity),
+        Identity = macula_e2e_keys:new(),
+        NodeId   = macula_e2e_keys:node_id(Identity),
         Record   = macula_record:node_record(NodeId, [Realm], 0,
                                              #{kind => <<"test_daemon">>}),
         Signed   = macula_record:sign(Record, Identity),
@@ -846,8 +960,8 @@ cross_station_tombstone_propagation(WriterPool, ReaderPool, Realm) ->
     do_tombstone_propagation(WriterPool, ReaderPool, Realm, 60_000).
 
 do_tombstone_propagation(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
-    Identity = macula_identity:generate(),
-    NodeId   = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId   = macula_e2e_keys:node_id(Identity),
     Record   = macula_record:node_record(NodeId, [Realm], 0,
                                          #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
@@ -966,8 +1080,8 @@ do_subscribe_records(WriterPool, ReaderPool, Realm, MaxWaitMs) ->
 subscribe_records_subscribed({ok, SubRef}, WriterPool, ReaderPool,
                              Realm, MaxWaitMs, Tag) ->
     timer:sleep(?SUBSCRIBE_SETTLE_MS),
-    Identity = macula_identity:generate(),
-    NodeId   = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId   = macula_e2e_keys:node_id(Identity),
     Record   = macula_record:node_record(NodeId, [Realm], 0,
                                          #{kind => <<"test_daemon">>}),
     Signed   = macula_record:sign(Record, Identity),
@@ -1005,8 +1119,8 @@ await_record_callback(Tag, ExpectedKey, PutAt, TimeoutMs) ->
                                  ReaderPool :: macula:pool(),
                                  macula:realm()) -> result().
 cross_station_dht_put_find(WriterPool, ReaderPool, Realm) ->
-    Identity = macula_identity:generate(),
-    NodeId = macula_identity:public(Identity),
+    Identity = macula_e2e_keys:new(),
+    NodeId = macula_e2e_keys:node_id(Identity),
     Record = macula_record:node_record(NodeId, [Realm], 0,
                                        #{kind => <<"test_daemon">>}),
     Signed = macula_record:sign(Record, Identity),
