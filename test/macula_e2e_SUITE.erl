@@ -202,13 +202,25 @@ connect_fleet(Bootstrap, BootstrapOther, Config) ->
     PoolKp  = macula_e2e_keys:new(#{puzzle => true}),
     OtherKp = macula_e2e_keys:new(#{puzzle => true}),
     CrossKp = macula_e2e_keys:new(#{puzzle => true}),
-    {ok, Pool}  = macula:connect(Bootstrap, #{node_identity => PoolKp}),
-    {ok, Other} = macula:connect(Bootstrap, #{node_identity => OtherKp}),
+    %% macula-portal#89 is an mcl-tube lookup, and mcl-tube advertises inside
+    %% an org namespace: a pool that pins no realm key cannot resolve it and
+    %% answers `{error, {unresolved, no_trusted_advertisement}}' at the FULL
+    %% deadline, which is the very 5 s loss the issue reports. The portal
+    %% pins io.macula on its one pool, so the harness pins the same key on
+    %% its pools; the `_test' realm probes advertise `_/...' and never
+    %% consult it.
+    Trust = macula_e2e_io_macula_realm:trust(),
+    {ok, Pool}  = macula:connect(Bootstrap,
+                                 #{node_identity => PoolKp, realm_trust => Trust}),
+    {ok, Other} = macula:connect(Bootstrap,
+                                 #{node_identity => OtherKp, realm_trust => Trust}),
     {CrossOpt, CrossPools} =
         case BootstrapOther of
             undefined -> {undefined, []};
             _ ->
-                {ok, X} = macula:connect(BootstrapOther, #{node_identity => CrossKp}),
+                {ok, X} = macula:connect(BootstrapOther,
+                                         #{node_identity => CrossKp,
+                                           realm_trust => Trust}),
                 {X, [X]}
         end,
     NodeIds = [{pool_node_id,  macula_e2e_keys:node_id(PoolKp)},
@@ -450,40 +462,27 @@ cross_station_many_concurrent_calls(Config) ->
     end).
 
 %% macula-portal#89: the tube channel page's eight thumbnails, fired at once
-%% by ONE caller inside the portal's own 5 s call deadline. Sizes are the real
-%% page's (9 KiB .. 128 KiB, 324 KiB together), because a small echo reply
-%% never reaches the size at which the reported loss happens -- the adjacent
-%% many_concurrent_calls cases pass with a one-line reply and so cannot see it.
--define(PAGE_SIZES, [9132, 15360, 15360, 21504, 29696, 45056, 64512, 131072]).
+%% by ONE caller inside the portal's own 5 s call deadline, against the real
+%% mcl-tube on the fleet. Nothing is advertised here: the provider is the
+%% service, and each reply is checked against the MCID that asked for it, so
+%% a crossed, truncated or substituted reply fails even at the right size.
 -define(PAGE_DEADLINE_MS, 5_000).
 
-%% macula 16 refuses to advertise a procedure with no namespace
-%% (`{error, {provider_authorization, no_org_namespace}}'), and an org
-%% namespace then needs a realm-signed org directory and delegation. A
-%% procedure that carries NO namespace is written `_/<name>'
-%% (`macula_record:org_of/1': `org_of([<<"_">>, _Rest]) -> none'), which is
-%% what a transport probe wants: it is testing bytes on the wire, not the
-%% realm's trust chain.
 page_burst(Config) ->
-    Server = ?config(pool, Config),
-    Caller = ?config(other, Config),
-    Realm = ?config(test_realm, Config),
-    Procedure = own_procedure(Config, <<"e2e.page.burst">>),
+    Pool = ?config(pool, Config),
     expect_ok(macula_e2e_probe:page_burst(
-                Server, Caller, Realm, Procedure,
-                ?PAGE_SIZES, ?PAGE_DEADLINE_MS)).
+                Pool, ?config(io_macula_realm, Config),
+                macula_e2e_mcl_tube:mcids(), ?PAGE_DEADLINE_MS)).
 
+%% The same page dialed through a station in another part of the federation.
+%% The portal's own box is not where mcl-tube runs, so the extra hop is the
+%% normal case rather than a variant of it.
 cross_station_page_burst(Config) ->
-    cross_or_skip(Config, fun(Server, Caller) ->
-        Realm = ?config(test_realm, Config),
-        Procedure = own_procedure(Config, <<"e2e.cross.page.burst">>),
-        expect_ok(macula_e2e_probe:cross_station_page_burst(
-                    Server, Caller, Realm, Procedure,
-                    ?PAGE_SIZES, ?PAGE_DEADLINE_MS))
+    cross_or_skip(Config, fun(_Pool, Cross) ->
+        expect_ok(macula_e2e_probe:page_burst(
+                    Cross, ?config(io_macula_realm, Config),
+                    macula_e2e_mcl_tube:mcids(), ?PAGE_DEADLINE_MS))
     end).
-
-own_procedure(_Config, Name) ->
-    <<"_/", (unique_topic(Name))/binary>>.
 
 many_concurrent_streams(Config) ->
     Server = ?config(pool, Config),

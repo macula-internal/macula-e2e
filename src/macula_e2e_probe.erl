@@ -40,8 +40,7 @@
     cross_station_multi_publisher_pubsub/6,
     many_concurrent_calls/5,
     cross_station_many_concurrent_calls/5,
-    page_burst/6,
-    cross_station_page_burst/6,
+    page_burst/4,
     many_concurrent_streams/5,
     cross_station_many_concurrent_streams/5,
     many_concurrent_dht_records/3,
@@ -553,57 +552,65 @@ cross_station_many_concurrent_calls(NumCalls, ServerPool, CallerPool,
     many_concurrent_calls(NumCalls, ServerPool, CallerPool,
                           Realm, Procedure).
 
-%% @doc The production shape of macula-portal#89: ONE caller pool fires the
-%% tube channel page's thumbnail lookups at once, each asking for its own
-%% reply size, every one inside the portal's own call deadline.
+%% @doc macula-portal#89: the tube channel page's eight thumbnail lookups,
+%% fired at once by ONE caller, every one inside the portal's own 5 s call
+%% deadline.
 %%
-%% Why this and not many_concurrent_calls/5: that one echoes a small
-%% correlation id, so no reply ever crosses a size at which the caller's
-%% admission, framing or route could behave differently. Here the replies
-%% are the page's real sizes (mixed_common:page/0 -- 9 KiB .. 128 KiB,
-%% 324 KiB together), which is the difference between the shape that passes
-%% in the lab and the shape macula-portal#89 reports failing live.
+%% This advertises NOTHING. The provider is mcl-tube on the fleet
+%% (`macula_e2e_mcl_tube'), and the caller's pool must be connected with
+%% io.macula's realm key pinned (`realm_trust'), or every lookup answers
+%% `{error, {unresolved, no_trusted_advertisement}}' at the FULL deadline.
+%% That is a 5 s loss produced by the harness, indistinguishable from the one
+%% the issue reports, so the pin is part of the probe and not an extra.
 %%
-%% A red run names EVERY call that did not answer with its own bytes inside
-%% DeadlineMs, next to how long it actually took, so the result says which
-%% shape of loss it was rather than only that something was lost.
--spec page_burst(ServerPool :: macula:pool(),
-                 CallerPool :: macula:pool(),
+%% Why this and not many_concurrent_calls/5: that one advertises its own echo
+%% and returns a correlation id, so no reply crosses a size at which the
+%% caller's admission, framing or route could behave differently, and no
+%% reply is content-addressed. Here each reply is checked against the MCID
+%% that asked for it (`macula_e2e_mcl_tube:bytes_match/2'), so a crossed,
+%% truncated or substituted reply cannot pass as an answer.
+%%
+%% A red run names EVERY lookup that did not answer with its own bytes inside
+%% DeadlineMs, beside how long it actually took, so the result says which
+%% shape of loss it was -- not-found, unresolved, wrong content, or a reply
+%% that arrived too late.
+-spec page_burst(Pool :: macula:pool(),
                  macula:realm(),
-                 macula:procedure(),
-                 Sizes :: [pos_integer()],
+                 Mcids :: [binary()],
                  DeadlineMs :: pos_integer()) -> result().
-page_burst(ServerPool, CallerPool, Realm, Procedure, Sizes, DeadlineMs) ->
-    Handler = fun(#{<<"bytes">> := N}) ->
-                      {ok, #{<<"payload">> => binary:copy(<<"x">>, N)}}
-              end,
-    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{auth => open}),
-    timer:sleep(?ADVERTISE_SETTLE_MS),
-    Result = fire_page(CallerPool, Realm, Procedure, Sizes, DeadlineMs),
-    catch macula:unadvertise(ServerPool, Realm, Procedure),
-    Result.
+page_burst(Pool, Realm, [First | _] = Mcids, DeadlineMs) ->
+    warm_then_burst(warm_up(Pool, Realm, First, DeadlineMs),
+                    Pool, Realm, Mcids, DeadlineMs).
 
-%% @doc Cross-station variant: the provider advertises on one station and the
-%% caller dials a different one -- the live portal's path, where the portal is
-%% on its own box and mcl-tube is on another.
--spec cross_station_page_burst(macula:pool(), macula:pool(),
-                               macula:realm(), macula:procedure(),
-                               [pos_integer()], pos_integer()) -> result().
-cross_station_page_burst(ServerPool, CallerPool, Realm, Procedure,
-                         Sizes, DeadlineMs) ->
-    page_burst(ServerPool, CallerPool, Realm, Procedure, Sizes, DeadlineMs).
+warm_then_burst({error, _} = Refused, _Pool, _Realm, _Mcids, _DeadlineMs) ->
+    Refused;
+warm_then_burst({ok, _WarmMs}, Pool, Realm, Mcids, DeadlineMs) ->
+    fire_page(Pool, Realm, Mcids, DeadlineMs).
 
-fire_page(CallerPool, Realm, Procedure, Sizes, DeadlineMs) ->
+%% One lookup on its own before the burst: the burst may not be the first
+%% traffic this pool ever sends, and a run in which NO lookup works at all
+%% says something different from one in which seven of eight do.
+warm_up(Pool, Realm, Mcid, DeadlineMs) ->
+    T0 = erlang:monotonic_time(millisecond),
+    Reply = macula:call(Pool, Realm, macula_e2e_mcl_tube:procedure(),
+                        macula_e2e_mcl_tube:payload(Mcid), DeadlineMs),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    case judge_one(Mcid, Reply) of
+        ok    -> {ok, Elapsed};
+        Why   -> {error, {page_burst_warm_up, ms, Elapsed, why, Why}}
+    end.
+
+fire_page(Pool, Realm, Mcids, DeadlineMs) ->
     Parent = self(),
     Started = erlang:monotonic_time(millisecond),
     Ref = make_ref(),
     [spawn_link(fun() ->
         T0 = erlang:monotonic_time(millisecond),
-        Reply = macula:call(CallerPool, Realm, Procedure,
-                            #{<<"bytes">> => Size}, DeadlineMs),
-        Parent ! {Ref, Seq, Size, erlang:monotonic_time(millisecond) - T0, Reply}
-     end) || {Seq, Size} <- lists:zip(lists:seq(1, length(Sizes)), Sizes)],
-    Outcome = collect_page(Ref, length(Sizes), []),
+        Reply = macula:call(Pool, Realm, macula_e2e_mcl_tube:procedure(),
+                            macula_e2e_mcl_tube:payload(Mcid), DeadlineMs),
+        Parent ! {Ref, Seq, Mcid, erlang:monotonic_time(millisecond) - T0, Reply}
+     end) || {Seq, Mcid} <- lists:zip(lists:seq(1, length(Mcids)), Mcids)],
+    Outcome = collect_page(Ref, length(Mcids), []),
     Total = erlang:monotonic_time(millisecond) - Started,
     judge_page(Outcome, Total, DeadlineMs).
 
@@ -611,36 +618,43 @@ collect_page(_Ref, 0, Acc) ->
     lists:reverse(Acc);
 collect_page(Ref, Remaining, Acc) ->
     receive
-        {Ref, Seq, Size, Elapsed, Reply} ->
+        {Ref, Seq, Mcid, Elapsed, Reply} ->
             collect_page(Ref, Remaining - 1,
-                         [{Seq, Size, Elapsed, judge_one(Size, Reply)} | Acc])
+                         [{Seq, Mcid, Elapsed, judge_one(Mcid, Reply)} | Acc])
     after 60_000 ->
         {error, {page_burst, no_answer, outstanding, Remaining}}
     end.
 
-judge_one(Size, {ok, Reply}) when is_map(Reply) ->
-    case maps:get(<<"payload">>, normalise_keys(Reply), undefined) of
-        Bin when is_binary(Bin) ->
-            case byte_size(Bin) of
-                Size -> ok;
-                Got  -> {wrong_size, Got, expected, Size}
-            end;
+judge_one(Mcid, {ok, Reply}) when is_map(Reply) ->
+    case normalise_keys(Reply) of
+        #{<<"bytes">> := Bytes} when is_binary(Bytes) ->
+            judge_bytes(Mcid, Bytes);
         Other ->
-            {no_payload, Other}
+            {no_bytes, Other}
     end;
-judge_one(_Size, {ok, Other}) ->
+judge_one(_Mcid, {ok, Other}) ->
     {unexpected_reply, Other};
-judge_one(_Size, {error, Reason}) ->
+judge_one(_Mcid, {error, Reason}) ->
     {error, Reason};
-judge_one(_Size, Other) ->
+judge_one(_Mcid, Other) ->
     {unexpected, Other}.
+
+judge_bytes(Mcid, Bytes) ->
+    case macula_e2e_mcl_tube:bytes_match(Bytes, Mcid) of
+        true  -> ok;
+        false -> {wrong_bytes, byte_size(Bytes), not_the_mcid_asked_for}
+    end.
 
 judge_page({error, _} = E, _Total, _DeadlineMs) ->
     E;
 judge_page(Outcome, Total, DeadlineMs) ->
-    Bad = [{seq, Seq, bytes, Size, ms, Elapsed, why, Why}
-           || {Seq, Size, Elapsed, Why} <- Outcome, Why =/= ok],
+    Bad = [{seq, Seq, mcid, short_mcid(Mcid), ms, Elapsed, why, Why}
+           || {Seq, Mcid, Elapsed, Why} <- Outcome, Why =/= ok],
     judge_lost(Bad, Total, DeadlineMs).
+
+%% A full MCID in a failure term buries the report in 100 hex characters.
+short_mcid(Mcid) ->
+    binary:part(Mcid, 0, 12).
 
 judge_lost([], Total, DeadlineMs) when Total =< DeadlineMs ->
     ok;
