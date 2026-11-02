@@ -73,6 +73,13 @@ finding, so the tree has to stay clean. It checks undefined calls only;
 `rebar.config`'s `xref_checks` entry says why `exports_not_used` is not one
 of them here.
 
+`rebar3 xref` reads the default profile and never sees `test/`, so the same
+job also runs [`scripts/xref-test-beams.sh`](scripts/xref-test-beams.sh): it
+compiles the test profile and analyses those beams, which is where a suite's
+call to a removed arity would otherwise hide. `seam/` is not covered — its
+dependencies are private, so every call there would read as undefined; it
+runs by hand where that source is readable.
+
 The live burst runs by hand, from a machine with IPv6 egress, with
 [`scripts/run-page-burst.sh`](scripts/run-page-burst.sh): before a portal
 release, after any station release or fleet move, and whenever someone

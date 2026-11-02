@@ -3,15 +3,19 @@ name: build
 on:
   push:
     branches: [main]
-    # A README or an operator script does not change the image, and a build
-    # here pushes `:latest' — the tag every station watching this image
-    # rolls onto. Without this, a typo fix in a `.md` file redeploys the
-    # fleet for nothing. Pull requests are not filtered: the tree checks
-    # cost seconds and always run.
+    # A README does not change the image, and a build here pushes `:latest' —
+    # the tag every station watching this image rolls onto. Without this, a
+    # typo fix in a `.md` file redeploys the fleet for nothing. Pull requests
+    # are not filtered: the tree checks cost seconds and always run.
+    #
+    # ⛔ `scripts/**` is deliberately NOT ignored: the Dockerfile COPYs
+    # `scripts/run-once.sh' to /usr/local/bin and makes it the ENTRYPOINT, so
+    # ignoring that directory would merge a change to the entrypoint and ship
+    # no image. An operator-script edit rebuilding the image is a cost; a
+    # silent stale entrypoint on every box is not.
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - 'scripts/**'
   # A branch had no check at all: a reviewer could only be told "it
   # compiles here", which is how a suite that could not run a single case
   # stayed green for a month (macula-internal/macula-e2e#1). The image job
@@ -69,6 +73,14 @@ jobs:
 
       - name: xref
         run: rebar3 xref
+
+      # `rebar3 xref' analyses the default profile and never sees `test/', so a
+      # suite calling a function that no longer exists passes all of the above
+      # and fails only when the case runs — the rot of e2e#1, in the one place
+      # CI cannot execute. The script compiles the test profile and analyses
+      # those beams; red-first is one call reverted to a removed arity.
+      - name: xref over the test beams
+        run: scripts/xref-test-beams.sh
 
   # ⛔ The live burst is NOT a CI job, deliberately. The stations are
   # AAAA-only and a GitHub-hosted runner has no IPv6 egress
