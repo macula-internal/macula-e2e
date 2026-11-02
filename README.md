@@ -72,7 +72,7 @@ job would be red on rot that pre-dates the branch (132 warnings at ff6ead0);
 it lands with the repair of `macula_e2e_duel` and `macula_e2e_probe`, which
 is the rest of e2e#1's suite.
 
-The live burst runs from host00, by hand, with
+The live burst runs by hand, from a machine with IPv6 egress, with
 [`scripts/run-page-burst.sh`](scripts/run-page-burst.sh): before a portal
 release, after any station release or fleet move, and whenever someone
 reports a thumbnail that does not render. Green there means the channel

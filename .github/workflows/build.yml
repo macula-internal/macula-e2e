@@ -69,9 +69,9 @@ jobs:
   # (`seam/realm_seam_SUITE`'s own header records mcl-om's live-mesh-tests
   # job burning 18 minutes a run for a deterministic red), and this
   # repository is PUBLIC, so no self-hosted runner may take work from it.
-  # A job that can only read as skipped is theatre; the burst runs from
-  # host00 on demand instead — `scripts/run-page-burst.sh`, and the README
-  # says when.
+  # A job that can only read as skipped is theatre; the burst runs on demand
+  # instead, from a machine with IPv6 egress — `scripts/run-page-burst.sh`,
+  # and the README says when.
 
   image:
     if: github.event_name != 'pull_request'

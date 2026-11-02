@@ -8,7 +8,8 @@
 #
 # ⛔ NOT in CI, deliberately. The stations are AAAA-only and GitHub-hosted
 # runners have no IPv6 egress; this repository is PUBLIC, so no self-hosted
-# runner may take work from it either. Run it from host00, by hand:
+# runner may take work from it either. Run it, by hand, from a machine with
+# IPv6 egress:
 #
 #   * before a portal release, and after any station release or fleet move;
 #   * whenever someone reports a thumbnail that does not render.
