@@ -45,6 +45,8 @@
     cross_station_multi_publisher_pubsub/1,
     many_concurrent_calls/1,
     cross_station_many_concurrent_calls/1,
+    page_burst/1,
+    cross_station_page_burst/1,
     many_concurrent_streams/1,
     cross_station_many_concurrent_streams/1,
     many_concurrent_dht_records/1,
@@ -112,6 +114,8 @@ all() ->
      cross_station_multi_publisher_pubsub,
      many_concurrent_calls,
      cross_station_many_concurrent_calls,
+     page_burst,
+     cross_station_page_burst,
      many_concurrent_streams,
      cross_station_many_concurrent_streams,
      many_concurrent_dht_records,
@@ -443,6 +447,32 @@ cross_station_many_concurrent_calls(Config) ->
         Procedure = unique_topic(<<"e2e.cross.many.echo">>),
         macula_e2e_probe:cross_station_many_concurrent_calls(
             10, Server, Caller, Realm, Procedure)
+    end).
+
+%% macula-portal#89: the tube channel page's eight thumbnails, fired at once
+%% by ONE caller inside the portal's own 5 s call deadline. Sizes are the real
+%% page's (9 KiB .. 128 KiB, 324 KiB together), because a small echo reply
+%% never reaches the size at which the reported loss happens -- the adjacent
+%% many_concurrent_calls cases pass with a one-line reply and so cannot see it.
+-define(PAGE_SIZES, [9132, 15360, 15360, 21504, 29696, 45056, 64512, 131072]).
+-define(PAGE_DEADLINE_MS, 5_000).
+
+page_burst(Config) ->
+    Server = ?config(pool, Config),
+    Caller = ?config(other, Config),
+    Realm = ?config(test_realm, Config),
+    Procedure = unique_topic(<<"e2e.page.burst">>),
+    expect_ok(macula_e2e_probe:page_burst(
+                Server, Caller, Realm, Procedure,
+                ?PAGE_SIZES, ?PAGE_DEADLINE_MS)).
+
+cross_station_page_burst(Config) ->
+    cross_or_skip(Config, fun(Server, Caller) ->
+        Realm = ?config(test_realm, Config),
+        Procedure = unique_topic(<<"e2e.cross.page.burst">>),
+        expect_ok(macula_e2e_probe:cross_station_page_burst(
+                    Server, Caller, Realm, Procedure,
+                    ?PAGE_SIZES, ?PAGE_DEADLINE_MS))
     end).
 
 many_concurrent_streams(Config) ->

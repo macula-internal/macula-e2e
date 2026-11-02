@@ -40,6 +40,8 @@
     cross_station_multi_publisher_pubsub/6,
     many_concurrent_calls/5,
     cross_station_many_concurrent_calls/5,
+    page_burst/6,
+    cross_station_page_burst/6,
     many_concurrent_streams/5,
     cross_station_many_concurrent_streams/5,
     many_concurrent_dht_records/3,
@@ -550,6 +552,104 @@ cross_station_many_concurrent_calls(NumCalls, ServerPool, CallerPool,
                                     Realm, Procedure) ->
     many_concurrent_calls(NumCalls, ServerPool, CallerPool,
                           Realm, Procedure).
+
+%% @doc The production shape of macula-portal#89: ONE caller pool fires the
+%% tube channel page's thumbnail lookups at once, each asking for its own
+%% reply size, every one inside the portal's own call deadline.
+%%
+%% Why this and not many_concurrent_calls/5: that one echoes a small
+%% correlation id, so no reply ever crosses a size at which the caller's
+%% admission, framing or route could behave differently. Here the replies
+%% are the page's real sizes (mixed_common:page/0 -- 9 KiB .. 128 KiB,
+%% 324 KiB together), which is the difference between the shape that passes
+%% in the lab and the shape macula-portal#89 reports failing live.
+%%
+%% A red run names EVERY call that did not answer with its own bytes inside
+%% DeadlineMs, next to how long it actually took, so the result says which
+%% shape of loss it was rather than only that something was lost.
+-spec page_burst(ServerPool :: macula:pool(),
+                 CallerPool :: macula:pool(),
+                 macula:realm(),
+                 macula:procedure(),
+                 Sizes :: [pos_integer()],
+                 DeadlineMs :: pos_integer()) -> result().
+page_burst(ServerPool, CallerPool, Realm, Procedure, Sizes, DeadlineMs) ->
+    Handler = fun(#{<<"bytes">> := N}) ->
+                      {ok, #{<<"payload">> => binary:copy(<<"x">>, N)}}
+              end,
+    ok = macula:advertise(ServerPool, Realm, Procedure, Handler, #{}),
+    timer:sleep(?ADVERTISE_SETTLE_MS),
+    Result = fire_page(CallerPool, Realm, Procedure, Sizes, DeadlineMs),
+    catch macula:unadvertise(ServerPool, Realm, Procedure),
+    Result.
+
+%% @doc Cross-station variant: the provider advertises on one station and the
+%% caller dials a different one -- the live portal's path, where the portal is
+%% on its own box and mcl-tube is on another.
+-spec cross_station_page_burst(macula:pool(), macula:pool(),
+                               macula:realm(), macula:procedure(),
+                               [pos_integer()], pos_integer()) -> result().
+cross_station_page_burst(ServerPool, CallerPool, Realm, Procedure,
+                         Sizes, DeadlineMs) ->
+    page_burst(ServerPool, CallerPool, Realm, Procedure, Sizes, DeadlineMs).
+
+fire_page(CallerPool, Realm, Procedure, Sizes, DeadlineMs) ->
+    Parent = self(),
+    Started = erlang:monotonic_time(millisecond),
+    Ref = make_ref(),
+    [spawn_link(fun() ->
+        T0 = erlang:monotonic_time(millisecond),
+        Reply = macula:call(CallerPool, Realm, Procedure,
+                            #{<<"bytes">> => Size}, DeadlineMs),
+        Parent ! {Ref, Seq, Size, erlang:monotonic_time(millisecond) - T0, Reply}
+     end) || {Seq, Size} <- lists:zip(lists:seq(1, length(Sizes)), Sizes)],
+    Outcome = collect_page(Ref, length(Sizes), []),
+    Total = erlang:monotonic_time(millisecond) - Started,
+    judge_page(Outcome, Total, DeadlineMs).
+
+collect_page(_Ref, 0, Acc) ->
+    lists:reverse(Acc);
+collect_page(Ref, Remaining, Acc) ->
+    receive
+        {Ref, Seq, Size, Elapsed, Reply} ->
+            collect_page(Ref, Remaining - 1,
+                         [{Seq, Size, Elapsed, judge_one(Size, Reply)} | Acc])
+    after 60_000 ->
+        {error, {page_burst, no_answer, outstanding, Remaining}}
+    end.
+
+judge_one(Size, {ok, Reply}) when is_map(Reply) ->
+    case maps:get(<<"payload">>, normalise_keys(Reply), undefined) of
+        Bin when is_binary(Bin) ->
+            case byte_size(Bin) of
+                Size -> ok;
+                Got  -> {wrong_size, Got, expected, Size}
+            end;
+        Other ->
+            {no_payload, Other}
+    end;
+judge_one(_Size, {ok, Other}) ->
+    {unexpected_reply, Other};
+judge_one(_Size, {error, Reason}) ->
+    {error, Reason};
+judge_one(_Size, Other) ->
+    {unexpected, Other}.
+
+judge_page({error, _} = E, _Total, _DeadlineMs) ->
+    E;
+judge_page(Outcome, Total, DeadlineMs) ->
+    Bad = [{seq, Seq, bytes, Size, ms, Elapsed, why, Why}
+           || {Seq, Size, Elapsed, Why} <- Outcome, Why =/= ok],
+    judge_lost(Bad, Total, DeadlineMs).
+
+judge_lost([], Total, DeadlineMs) when Total =< DeadlineMs ->
+    ok;
+judge_lost([], Total, DeadlineMs) ->
+    {error, {page_burst_all_answered_but_late, total_ms, Total,
+             deadline_ms, DeadlineMs}};
+judge_lost(Bad, Total, DeadlineMs) ->
+    {error, {page_burst_lost, total_ms, Total, deadline_ms, DeadlineMs,
+             lost, Bad}}.
 
 gather_caller_results([], 0, Errors) ->
     case Errors of
