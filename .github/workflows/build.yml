@@ -41,44 +41,43 @@ jobs:
         run: rebar3 eunit
 
   # ⛔ eunit cannot see the rot this harness suffered (macula-internal/
-  # macula-e2e#1): Erlang resolves remote calls at run time, so a suite that
-  # cannot start a single case at its own pin leaves eunit green. Only
-  # `rebar3 ct` runs what a deployment runs.
+  # macula-e2e#1): Erlang resolves remote calls at run time, so sixteen calls
+  # to `macula_identity' — a module macula deleted at 12 — compiled happily,
+  # passed lint and eunit, and failed only when a case tried to run them.
+  # xref reads those calls before anything runs, which is why it is here.
   #
-  # It cannot run here yet. The fleet's stations are AAAA-only, and a
-  # GitHub-hosted runner has no IPv6 egress (`seam/realm_seam_SUITE`'s own
-  # header records this: mcl-om's live-mesh-tests job burned 18 minutes a run
-  # for a deterministic red), so a hosted runner can never reach a station.
-  # Pointing this job at ubuntu-latest would not be a gate, it would be a
-  # guaranteed red.
-  #
-  # It runs when BOTH exist, and only then:
-  #   1. a runner with IPv6 egress and a `pq' label registered for this
-  #      repository or its org (none is today: macula-internal has
-  #      `msi00-internal-1', which is neither labelled ipv6 nor allowed to
-  #      take work from a public repository without that decision being
-  #      taken deliberately), and
-  #   2. `MACULA_E2E_CT_SEED` as a repository variable, in the pinned form
-  #      `https://host:4433#<64 hex node id>` macula 16 requires.
-  #
-  # Skipping is visible as a skipped job, never as a green suite: an unset
-  # seed must not read like a passing gate.
-  ct:
-    if: vars.MACULA_E2E_CT_SEED != ''
-    runs-on: [self-hosted, pq, ipv6]
-    timeout-minutes: 30
+  # ⚠ It REPORTS today, it does not gate: `rebar3 xref' exits 0 on Xref
+  # warnings. At a2b27c4 it names ten undefined calls, all in probes the
+  # package for the rest of the suite owns — `macula_identity:generate/0'
+  # twice in `macula_e2e_duel', `macula:put_content/2' and
+  # `macula:get_content/2' (macula 16 took a realm and became
+  # `share_content/3' and `get_content/3') in `macula_e2e_probe', plus
+  # `macula_download:start_link_direct/5' and `macula:get_content_station/5'.
+  # Making this fatal is one line, and it belongs in the commit that repairs
+  # those probes: reddening main on pre-existing rot before the repair is an
+  # outage, not a check.
+  xref:
+    runs-on: ubuntu-latest
+    container: ghcr.io/macula-io/macula-ci-otp:20260923-1352@sha256:aff1d39bc4aa29d13044b90b38e9b7f4b757d50818cc11c5bb7e84cdbf82ac70
     steps:
       - uses: actions/checkout@v4
 
-      - name: Common Test against the live fleet
-        env:
-          MACULA_E2E_BOOTSTRAP: ${{ vars.MACULA_E2E_CT_SEED }}
-        run: rebar3 ct --suite test/macula_e2e_SUITE
+      - name: xref
+        run: rebar3 xref
+
+  # ⛔ The live burst is NOT a CI job, deliberately. The stations are
+  # AAAA-only and a GitHub-hosted runner has no IPv6 egress
+  # (`seam/realm_seam_SUITE`'s own header records mcl-om's live-mesh-tests
+  # job burning 18 minutes a run for a deterministic red), and this
+  # repository is PUBLIC, so no self-hosted runner may take work from it.
+  # A job that can only read as skipped is theatre; the burst runs from
+  # host00 on demand instead — `scripts/run-page-burst.sh`, and the README
+  # says when.
 
   image:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    needs: [lint, eunit]
+    needs: [lint, eunit, xref]
     permissions:
       contents: read
       packages: write

@@ -56,9 +56,24 @@ MACULA_E2E_BOOTSTRAP="https://station-fi-helsinki.macula.io:4433#<64 hex node id
 refuses a seed that does not name the node id it expects
 (`{error, {seeds, expected_node_id_required}}`), and a URL binary cannot carry
 one, so a seed is `https://host:port#<node id>` — the ids are published by
-mcl-stations' `list_stations`. The seed above the fleet's own DNS names
-reaches it from a host with IPv6; a GitHub-hosted runner has no IPv6 egress
-and cannot reach a station at all.
+mcl-stations' `list_stations`.
+
+### What CI runs, and what it cannot
+
+CI runs `rebar3 as lint lint`, `rebar3 eunit` and `rebar3 xref`, all on
+hosted runners. It does not run the suite: the stations are AAAA-only, a
+hosted runner has no IPv6 egress, and this repository is public, so no
+self-hosted runner may take work from it either. `xref` is the check that
+catches what eunit cannot — a call to a module or function that no longer
+exists compiles and passes eunit, which is how sixteen calls to
+`macula_identity` survived a year of green builds
+(macula-internal/macula-e2e#1).
+
+The live burst runs from host00, by hand, with
+[`scripts/run-page-burst.sh`](scripts/run-page-burst.sh): before a portal
+release, after any station release or fleet move, and whenever someone
+reports a thumbnail that does not render. Green there means the channel
+page's eight thumbnails all answer inside the portal's own 5 s deadline.
 
 ### Seam suite (station and realm, no fleet)
 
